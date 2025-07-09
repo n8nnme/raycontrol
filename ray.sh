@@ -165,6 +165,10 @@ if [[ "$RESOLVED_IP" != "$SERVER_IP" ]]; then
 fi
 echo -e "${GREEN}DNS validation successful!${NC}"
 
+echo -e "\n${GREEN}--- Creating dedicated group for certificate access ---${NC}"
+groupadd --system certs-access || echo "Group 'certs-access' already exists."
+usermod -a -G certs-access nobody
+echo "Added user 'nobody' to 'certs-access' group for secure certificate reading."
 
 # 7. Write raycontrol CLI
 cat > /usr/local/bin/raycontrol <<'EOF'
@@ -346,7 +350,7 @@ cat > /etc/xray/config.json <<EOF
     {
       "port": $PORT_VLESS, "protocol": "vless",
       "settings": {"clients": [{"id": "$UUID_VLESS", "flow": "xtls-rprx-vision"}], "decryption": "none"},
-      "streamSettings": {"network": "tcp", "security": "xtls", "xtlsSettings": {"certificates": [{"certificateFile": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem", "keyFile": "/etc/letsencrypt/live/$DOMAIN/privkey.pem"}], "alpn": ["h2"]}}
+      "streamSettings": {"network": "tcp", "security": "tls", "xtlsSettings": {"certificates": [{"certificateFile": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem", "keyFile": "/etc/letsencrypt/live/$DOMAIN/privkey.pem"}], "alpn": ["h2"]}}
     },
     {
       "port": $PORT_TROJAN, "protocol": "trojan",
