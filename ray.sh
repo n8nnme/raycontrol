@@ -406,7 +406,7 @@ auth:
   type: password
   password: $PASSWORD_HYSTERIA
 obfs:
-  type: password
+  type: salamander
   password: $PASSWORD_HYSTERIA_OBFS
 masquerade:
   type: proxy
@@ -440,7 +440,7 @@ echo -e "\n${GREEN}--- Installation of all files is complete. ---${NC}"
 # 18. Final Info
 VLESS_URI="vless://${UUID_VLESS}@${DOMAIN}:${PORT_VLESS}?type=tcp&security=xtls&flow=xtls-rprx-vision&alpn=h2&sni=${DOMAIN}#${DOMAIN}-VLESS"
 TROJAN_URI="trojan://${PASSWORD_TROJAN}@${DOMAIN}:${PORT_TROJAN}?alpn=h2&sni=${DOMAIN}#${DOMAIN}-Trojan"
-HYSTERIA_URI="hysteria2://${PASSWORD_HYSTERIA}@${DOMAIN}:${PORT_HYSTERIA}?sni=${DOMAIN}&obfs=password&obfs-password=${PASSWORD_HYSTERIA_OBFS}#${DOMAIN}-Hysteria2"
+HYSTERIA_URI="hysteria2://${PASSWORD_HYSTERIA}@${DOMAIN}:${PORT_HYSTERIA}?sni=${DOMAIN}&obfs=salamander&obfs-password=${PASSWORD_HYSTERIA_OBFS}#${DOMAIN}-Hysteria2"
 
 echo -e "\n\n${YELLOW}=====================================================${NC}"
 echo -e "${YELLOW}               ACTION REQUIRED TO ACTIVATE               ${NC}"
