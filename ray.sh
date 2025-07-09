@@ -378,21 +378,22 @@ EOF
 # 14. Install Hysteria2
 echo -e "\n${GREEN}--- Installing Hysteria2 ---${NC}"
 
-# Fetch latest tag (strip leading 'v')
-HY_VER=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest \
-         | jq -r .tag_name | sed 's/^v//')
+RAW_TAG=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest \
+           | jq -r .tag_name)
 
-# Download with minimal output but errors shown
-if wget -nv -O /usr/local/bin/hysteria-server \
-     "https://github.com/apernet/hysteria/releases/download/v${HY_VER}/hysteria-linux-amd64"; then
-  echo -e "${GREEN}Download succeeded (v${HY_VER})${NC}"
+ENC_TAG=${RAW_TAG//\//%2F}
+
+DOWNLOAD_URL="https://github.com/apernet/hysteria/releases/download/${ENC_TAG}/hysteria-linux-amd64"
+
+if wget -nv -O /usr/local/bin/hysteria-server "$DOWNLOAD_URL"; then
+  echo -e "${GREEN}Downloaded hysteria-server (${RAW_TAG})${NC}"
 else
-  echo -e "${RED}Download failed for v${HY_VER}${NC}" >&2
+  echo -e "${RED}Failed to download hysteria-server from ${DOWNLOAD_URL}${NC}" >&2
   exit 1
 fi
 
 chmod +x /usr/local/bin/hysteria-server
-echo -e "${GREEN}Hysteria2 installed!${NC}"
+echo -e "${GREEN}Hysteria2 installed successfully!${NC}"
 
 # 15. Configure Hysteria2
 mkdir -p /etc/hysteria
