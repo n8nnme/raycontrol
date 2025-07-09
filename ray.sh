@@ -139,7 +139,7 @@ WEBPATH_TROJAN=$(head -c64 /dev/urandom | tr -dc 'A-Za-z0-9')
 
 # 6. DNS Validation
 echo -e "\n${GREEN}--- Validating DNS Records ---${NC}"
-SERVER_IP=$(curl -s https://api.ipify.org)
+SERVER_IP=$(curl -s https://ipwho.de/ip)
 if [[ -z "$SERVER_IP" ]]; then
     echo -e "${RED}ERROR: Could not determine server's public IP address.${NC}" >&2
     exit 1
@@ -333,7 +333,9 @@ echo -e "\n${GREEN}--- Installing Xray-core ---${NC}"
 mkdir -p /etc/xray /var/log/xray
 chown -R nobody:nogroup /etc/xray /var/log/xray
 XRAY_VER=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
-wget -qO- "https://github.com/XTLS/Xray-core/releases/download/$XRAY_VER/Xray-linux-64.zip" | funzip >/usr/local/bin/xray
+wget -qO /tmp/Xray-linux-64.zip "https://github.com/XTLS/Xray-core/releases/download/$XRAY_VER/Xray-linux-64.zip" \
+  && sudo unzip -qo /tmp/Xray-linux-64.zip -d /usr/local/bin \
+  && rm /tmp/Xray-linux-64.zip
 chmod +x /usr/local/bin/xray
 
 # 12. Configure Xray
