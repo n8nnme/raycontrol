@@ -144,8 +144,8 @@ if [[ -z "$SERVER_IP" ]]; then
     echo -e "${RED}ERROR: Could not determine server's public IP address.${NC}" >&2
     exit 1
 fi
-echo "This server's public IP is: ${YELLOW}$SERVER_IP${NC}"
-echo "Please ensure you have an A record for ${YELLOW}$DOMAIN${NC} pointing to this IP in your Cloudflare DNS."
+echo "This server's public IP is: $SERVER_IP"
+echo "Please ensure you have an A record for $DOMAIN pointing to this IP in your Cloudflare DNS."
 echo "Waiting 60 seconds for DNS to propagate..."
 
 for i in {60..1}; do
@@ -377,9 +377,22 @@ EOF
 
 # 14. Install Hysteria2
 echo -e "\n${GREEN}--- Installing Hysteria2 ---${NC}"
-HY_VER=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r .tag_name | sed 's/v//')
-wget -qO /usr/local/bin/hysteria-server "https://github.com/apernet/hysteria/releases/download/v$HY_VER/hysteria-linux-amd64"
+
+# Fetch latest tag (strip leading 'v')
+HY_VER=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest \
+         | jq -r .tag_name | sed 's/^v//')
+
+# Download with minimal output but errors shown
+if wget -nv -O /usr/local/bin/hysteria-server \
+     "https://github.com/apernet/hysteria/releases/download/v${HY_VER}/hysteria-linux-amd64"; then
+  echo -e "${GREEN}Download succeeded (v${HY_VER})${NC}"
+else
+  echo -e "${RED}Download failed for v${HY_VER}${NC}" >&2
+  exit 1
+fi
+
 chmod +x /usr/local/bin/hysteria-server
+echo -e "${GREEN}Hysteria2 installed!${NC}"
 
 # 15. Configure Hysteria2
 mkdir -p /etc/hysteria
