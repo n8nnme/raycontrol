@@ -83,6 +83,13 @@ if [[ "${CONFIRM,,}" != "y" ]]; then
     exit 1
 fi
 
+
+apt update && apt upgrade
+apt install -y \
+  curl wget unzip jq iptables ipset certbot qrencode \
+  python3-certbot-dns-cloudflare \
+  uuid-runtime openssl socat iptables-persistent gawk uuid uuid-dev uuid-runtime uuidcdef
+
 # 4. Generate credentials & paths
 UUID_VLESS=$(uuidgen)
 PASSWORD_TROJAN=$(head -c16 /dev/urandom | base64 | tr '+/' '_-' | cut -c1-16)
@@ -103,11 +110,6 @@ fi
 echo -e "\n${GREEN}--- Installing Dependencies ---${NC}"
 echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
 echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
-apt update
-apt install -y \
-  curl wget unzip jq iptables ipset certbot qrencode \
-  python3-certbot-dns-cloudflare \
-  uuid-runtime openssl socat iptables-persistent gawk
 
 # Install detected XanMod kernel version
 if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
