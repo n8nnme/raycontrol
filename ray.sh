@@ -81,6 +81,7 @@ fi
 UUID_VLESS=$(uuidgen)
 PASSWORD_TROJAN=$(head -c16 /dev/urandom | base64 | tr '+/' '_-' | cut -c1-16)
 PASSWORD_HYSTERIA=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
+PASSWORD_HYSTERIA_OBFS=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
 WEBPATH_TROJAN=$(head -c64 /dev/urandom | tr -dc 'A-Za-z0-9')
 
 # 5. Install dependencies
@@ -97,14 +98,64 @@ apt install -y \
 cat > /usr/local/bin/raycontrol <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+XCONF="/etc/xray/config.json"
+IPSET="xray_clients"
+DB_USERS="/etc/xray/users.db"
+DB_IPS="/etc/xray/ips.db"
 ENABLED_FLAG="/etc/xray/enabled.flag"
+
+ensure_db(){
+  mkdir -p /etc/xray
+  touch "$DB_USERS" "$DB_IPS" "$ENABLED_FLAG"
+}
+reload_xray(){
+  [[ -f "$ENABLED_FLAG" ]] && systemctl restart xray
+}
+add_user(){
+  type=${1:-}
+  if [[ $type == "vless" ]]; then
+    uuid=$(uuidgen)
+    jq --arg id "$uuid" '.inbounds[0].settings.clients += [{"id":$id,"flow":"xtls-rprx-vision"}]' "$XCONF" > tmp && mv tmp "$XCONF"
+    echo "vless:$uuid:h2-only" >>"$DB_USERS"
+    echo "Added VLESS user $uuid"
+  elif [[ $type == "trojan" ]]; then
+    pass=$(head -c16 /dev/urandom | base64 | tr '+/' '_-' | cut -c1-16)
+    path=$(head -c64 /dev/urandom | tr -dc 'A-Za-z0-9')
+    jq --arg pw "$pass" --arg p "/$path" '.inbounds[1].settings.clients += [{"password":$pw}] | .inbounds[1].settings.fallbacks += [{"path":$p,"dest":6001,"xver":1}]' "$XCONF" > tmp && mv tmp "$XCONF"
+    echo "trojan:$pass:$path" >>"$DB_USERS"
+    echo "Added Trojan user with path /$path"
+  else
+    echo "Usage: raycontrol add-user [vless|trojan]" >&2; exit 1
+  fi
+  reload_xray
+}
+del_user(){
+  id=$1; sed -i "\:^.*$id.*\$d" "$DB_USERS"
+  echo "Removed user '$id' from DB. Manual edit of $XCONF is required."
+}
+list_users(){
+  echo "=== Xray Users (type:id/pass:path) ==="
+  column -t -s: "$DB_USERS" || echo "(none)"
+}
+list_ips(){
+  echo "=== Whitelisted IPs ==="
+  ipset list $IPSET | awk '/Members:/{f=1;next} f' || echo "(none)"
+}
+add_ip(){
+  ip=$1; ipset add $IPSET "$ip"; echo "$ip" >>"$DB_IPS"
+  echo "Whitelisted IP $ip"
+}
+del_ip(){
+  ip=$1; ipset del $IPSET "$ip"; sed -i "\:^$ip\$d" "$DB_IPS"
+  echo "Removed IP $ip"
+}
 enable_all(){
   touch "$ENABLED_FLAG"
   bash /usr/local/bin/apply_iptables_xray.sh
   systemctl restart xray
   systemctl restart hysteria-server
   iptables-save > /etc/iptables/rules.v4
-  echo "Xray, Hysteria2, and firewall enabled and persisted."
+  echo "All services and firewall enabled and persisted."
 }
 disable_all(){
   rm -f "$ENABLED_FLAG"
@@ -116,17 +167,31 @@ disable_all(){
 }
 help(){
   cat <<MSG
-Usage: raycontrol <command>
-Commands:
-  help           Show this help
+Usage: raycontrol <command> [args]
+Services Management:
   enable         Enable all services + firewall and persist rules
   disable        Disable all services + firewall and persist flushed rules
+Xray User Management:
+  list-users     List VLESS/Trojan users
+  add-user [vless|trojan] Add a new VLESS or Trojan user
+  del-user <ID>  Delete a user from the local DB (manual xray config edit required)
+IP Whitelist Management:
+  list-ips       List whitelisted IPs for port knocking
+  add-ip <IP>    Whitelist an IP
+  del-ip <IP>    Remove a whitelisted IP
 MSG
 }
+ensure_db
 case "${1:-help}" in
   help)        help ;;
   enable)      enable_all ;;
   disable)     disable_all ;;
+  list-users)  list_users ;;
+  add-user)    add_user "${2:-}" ;;
+  del-user)    del_user "$2" ;;
+  list-ips)    list_ips ;;
+  add-ip)      add_ip "$2" ;;
+  del-ip)      del_ip "$2" ;;
   *)           help ;;
 esac
 EOF
@@ -138,9 +203,7 @@ cat > /usr/local/bin/apply_iptables_xray.sh <<EOF
 set -e
 TCP_PORTS="$SSH_PORT $PORT_VLESS $PORT_TROJAN"
 UDP_PORTS="$PORT_HYSTERIA"
-iptables -P INPUT DROP
-iptables -P FORWARD DROP
-iptables -P OUTPUT ACCEPT
+iptables -P INPUT DROP; iptables -P FORWARD DROP; iptables -P OUTPUT ACCEPT
 iptables -F && iptables -X
 iptables -A INPUT -i lo -j ACCEPT
 iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
@@ -247,6 +310,14 @@ tls:
 auth:
   type: password
   password: $PASSWORD_HYSTERIA
+obfs:
+  type: password
+  password: $PASSWORD_HYSTERIA_OBFS
+masquerade:
+  type: proxy
+  proxy:
+    url: https://1.1.1.1
+    rewriteHost: true
 EOF
 
 # 15. Setup Hysteria2 systemd service
@@ -273,7 +344,7 @@ echo
 read -rp "Apply firewall rules and start all services now? [y/N]: " RESP
 if [[ "${RESP,,}" == "y" ]]; then
   echo -e "${GREEN}Applying firewall and starting services...${NC}"
-  bash /usr/local/bin/raycontrol enable
+  raycontrol enable
 else
   echo -e "${YELLOW}To apply later, run: raycontrol enable${NC}"
 fi
@@ -281,7 +352,7 @@ fi
 # 17. Final Info
 VLESS_URI="vless://${UUID_VLESS}@${DOMAIN}:${PORT_VLESS}?type=tcp&security=xtls&flow=xtls-rprx-vision&alpn=h2&sni=${DOMAIN}#${DOMAIN}-VLESS"
 TROJAN_URI="trojan://${PASSWORD_TROJAN}@${DOMAIN}:${PORT_TROJAN}?alpn=h2&sni=${DOMAIN}#${DOMAIN}-Trojan"
-HYSTERIA_URI="hysteria2://${PASSWORD_HYSTERIA}@${DOMAIN}:${PORT_HYSTERIA}?sni=${DOMAIN}#${DOMAIN}-Hysteria2"
+HYSTERIA_URI="hysteria2://${PASSWORD_HYSTERIA}@${DOMAIN}:${PORT_HYSTERIA}?sni=${DOMAIN}&obfs=password&obfs-password=${PASSWORD_HYSTERIA_OBFS}#${DOMAIN}-Hysteria2"
 
 echo -e "\n\n${GREEN}=====================================================${NC}"
 echo -e "${GREEN}                 Installation Complete                 ${NC}"
@@ -297,7 +368,9 @@ echo -e "${YELLOW}Trojan (TCP, H2-Only):${NC}"
 echo "  Port: $PORT_TROJAN, Password: $PASSWORD_TROJAN"
 echo
 echo -e "${YELLOW}Hysteria2 (UDP):${NC}"
-echo "  Port: $PORT_HYSTERIA, Password: $PASSWORD_HYSTERIA"
+echo "  Port: $PORT_HYSTERIA"
+echo "  Auth Pass: $PASSWORD_HYSTERIA"
+echo "  OBFS Pass: $PASSWORD_HYSTERIA_OBFS"
 
 if command -v qrencode &> /dev/null; then
   echo -e "\n${YELLOW}--- QR Codes (scan with a client app) ---${NC}"
