@@ -16,7 +16,6 @@ fi
 # 2. Prompt for core parameters
 read -rp "Domain (e.g. your.domain.com): " DOMAIN
 read -rp "Cloudflare API Token: " CF_API_TOKEN
-read -rp "Cloudflare Zone ID: " CF_ZONE_ID
 read -rp "Let’s Encrypt email: " EMAIL
 
 echo
@@ -83,36 +82,23 @@ if [[ "${CONFIRM,,}" != "y" ]]; then
     exit 1
 fi
 
-
-apt update && apt upgrade
+# 4. Install Dependencies & XanMod
+echo -e "\n${GREEN}--- Installing Core Dependencies ---${NC}"
+apt update
 apt install -y \
   curl wget unzip jq iptables ipset certbot qrencode \
   python3-certbot-dns-cloudflare \
-  uuid-runtime openssl socat iptables-persistent gawk uuid uuid-dev uuid-runtime uuidcdef
+  uuid-runtime openssl socat iptables-persistent gawk dnsutils uuid uuid-dev uuid-runtime uuidcdef
 
-# 4. Generate credentials & paths
-UUID_VLESS=$(uuidgen)
-PASSWORD_TROJAN=$(head -c16 /dev/urandom | base64 | tr '+/' '_-' | cut -c1-16)
-PASSWORD_HYSTERIA=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
-PASSWORD_HYSTERIA_OBFS=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
-WEBPATH_TROJAN=$(head -c64 /dev/urandom | tr -dc 'A-Za-z0-9')
-
-# 5. Install XanMod Kernel (if requested)
 if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
     echo -e "\n${GREEN}--- Setting up XanMod Repository ---${NC}"
-    apt update
-    apt install -y wget gpg
+    apt install -y gpg
     echo 'deb http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-kernel.list
     wget -qO - https://dl.xanmod.org/gpg.key | gpg --dearmor -o /etc/apt/trusted.gpg.d/xanmod-kernel.gpg
-fi
+    
+    echo -e "\n${GREEN}--- Updating sources for XanMod ---${NC}"
+    apt update
 
-# 6. Install dependencies
-echo -e "\n${GREEN}--- Installing Dependencies ---${NC}"
-echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
-echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
-
-# Install detected XanMod kernel version
-if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
     echo -e "\n${GREEN}--- Checking CPU microarchitecture level ---${NC}"
     cat > /tmp/check_x86_v_level.awk <<'AWK'
 #!/usr/bin/awk -f
@@ -143,6 +129,42 @@ AWK
     apt install -y "$XANMOD_PKG_NAME"
     rm -f /tmp/check_x86_v_level.awk
 fi
+
+# 5. Generate credentials & paths
+UUID_VLESS=$(uuidgen)
+PASSWORD_TROJAN=$(head -c16 /dev/urandom | base64 | tr '+/' '_-' | cut -c1-16)
+PASSWORD_HYSTERIA=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
+PASSWORD_HYSTERIA_OBFS=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
+WEBPATH_TROJAN=$(head -c64 /dev/urandom | tr -dc 'A-Za-z0-9')
+
+# 6. DNS Validation
+echo -e "\n${GREEN}--- Validating DNS Records ---${NC}"
+SERVER_IP=$(curl -s https://api.ipify.org)
+if [[ -z "$SERVER_IP" ]]; then
+    echo -e "${RED}ERROR: Could not determine server's public IP address.${NC}" >&2
+    exit 1
+fi
+echo "This server's public IP is: ${YELLOW}$SERVER_IP${NC}"
+echo "Please ensure you have an A record for ${YELLOW}$DOMAIN${NC} pointing to this IP in your Cloudflare DNS."
+echo "Waiting 60 seconds for DNS to propagate..."
+
+for i in {60..1}; do
+    printf "\rWaiting... %2d" "$i"
+    sleep 1
+done
+echo -e "\rDone waiting. Now checking DNS resolution.${NC}"
+
+RESOLVED_IP=$(dig +short "$DOMAIN" @1.1.1.1 || echo "")
+echo "Resolved IP for $DOMAIN is: ${YELLOW}${RESOLVED_IP:-Not found}${NC}"
+
+if [[ "$RESOLVED_IP" != "$SERVER_IP" ]]; then
+    echo -e "\n${RED}ERROR: DNS validation failed!${NC}" >&2
+    echo "The domain ${YELLOW}$DOMAIN${NC} does not resolve to this server's IP (${YELLOW}$SERVER_IP${NC})." >&2
+    echo "Please update your DNS A record in Cloudflare and run the script again." >&2
+    exit 1
+fi
+echo -e "${GREEN}DNS validation successful!${NC}"
+
 
 # 7. Write raycontrol CLI
 cat > /usr/local/bin/raycontrol <<'EOF'
