@@ -407,7 +407,8 @@ auth:
   password: $PASSWORD_HYSTERIA
 obfs:
   type: salamander
-  password: $PASSWORD_HYSTERIA_OBFS
+  salamander:
+    password: $PASSWORD_HYSTERIA_OBFS
 masquerade:
   type: proxy
   proxy:
