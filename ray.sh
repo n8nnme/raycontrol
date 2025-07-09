@@ -106,10 +106,15 @@ ENABLED_FLAG="/etc/xray/enabled.flag"
 
 ensure_db(){
   mkdir -p /etc/xray
-  touch "$DB_USERS" "$DB_IPS" "$ENABLED_FLAG"
+  touch "$DB_USERS" "$DB_IPS"
+  if [ ! -f "$ENABLED_FLAG" ]; then
+      echo "disabled" > "$ENABLED_FLAG"
+  fi
 }
 reload_xray(){
-  [[ -f "$ENABLED_FLAG" ]] && systemctl restart xray
+  if [[ "$(cat $ENABLED_FLAG)" == "enabled" ]]; then
+    systemctl restart xray
+  fi
 }
 add_user(){
   type=${1:-}
@@ -150,15 +155,15 @@ del_ip(){
   echo "Removed IP $ip"
 }
 enable_all(){
-  touch "$ENABLED_FLAG"
+  echo "enabled" > "$ENABLED_FLAG"
   bash /usr/local/bin/apply_iptables_xray.sh
-  systemctl restart xray
-  systemctl restart hysteria-server
+  systemctl start xray
+  systemctl start hysteria-server
   iptables-save > /etc/iptables/rules.v4
   echo "All services and firewall enabled and persisted."
 }
 disable_all(){
-  rm -f "$ENABLED_FLAG"
+  echo "disabled" > "$ENABLED_FLAG"
   systemctl stop hysteria-server
   systemctl stop xray
   iptables -F
@@ -244,8 +249,10 @@ echo -e "\n${GREEN}--- Configuring Automatic Certificate Renewal ---${NC}"
 mkdir -p /etc/letsencrypt/renewal-hooks/post
 cat > /etc/letsencrypt/renewal-hooks/post/reload_services.sh <<'EOF'
 #!/usr/bin/env bash
-systemctl restart xray
-systemctl restart hysteria-server
+if [[ "$(cat /etc/xray/enabled.flag)" == "enabled" ]]; then
+    systemctl restart xray
+    systemctl restart hysteria-server
+fi
 EOF
 chmod +x /etc/letsencrypt/renewal-hooks/post/reload_services.sh
 
@@ -336,28 +343,27 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 
-# 16. Start services
+# 16. Finalize installation
 systemctl daemon-reload
 systemctl enable xray
 systemctl enable hysteria-server
-echo
-read -rp "Apply firewall rules and start all services now? [y/N]: " RESP
-if [[ "${RESP,,}" == "y" ]]; then
-  echo -e "${GREEN}Applying firewall and starting services...${NC}"
-  raycontrol enable
-else
-  echo -e "${YELLOW}To apply later, run: raycontrol enable${NC}"
-fi
+echo -e "\n${GREEN}--- Installation of all files is complete. ---${NC}"
 
 # 17. Final Info
 VLESS_URI="vless://${UUID_VLESS}@${DOMAIN}:${PORT_VLESS}?type=tcp&security=xtls&flow=xtls-rprx-vision&alpn=h2&sni=${DOMAIN}#${DOMAIN}-VLESS"
 TROJAN_URI="trojan://${PASSWORD_TROJAN}@${DOMAIN}:${PORT_TROJAN}?alpn=h2&sni=${DOMAIN}#${DOMAIN}-Trojan"
 HYSTERIA_URI="hysteria2://${PASSWORD_HYSTERIA}@${DOMAIN}:${PORT_HYSTERIA}?sni=${DOMAIN}&obfs=password&obfs-password=${PASSWORD_HYSTERIA_OBFS}#${DOMAIN}-Hysteria2"
 
-echo -e "\n\n${GREEN}=====================================================${NC}"
-echo -e "${GREEN}                 Installation Complete                 ${NC}"
-echo -e "${GREEN}=====================================================${NC}\n"
-echo -e "${YELLOW}--- Connection Info ---${NC}"
+echo -e "\n\n${YELLOW}=====================================================${NC}"
+echo -e "${YELLOW}               ACTION REQUIRED TO ACTIVATE               ${NC}"
+echo -e "${YELLOW}=====================================================${NC}\n"
+
+echo -e "Services are installed but NOT RUNNING. The firewall is NOT ACTIVE."
+echo -e "To start all services and apply the firewall for the first time, run:\n"
+echo -e "  ${GREEN}raycontrol enable${NC}\n"
+echo -e "After enabling, your system will be fully configured and ready."
+echo -e "Your IP will not be whitelisted automatically. You must perform the port knock first."
+echo -e "\n${YELLOW}--- Connection Info (once enabled) ---${NC}"
 echo "Knock sequence for all services: $K1 -> $K2 -> $K3"
 echo "SSH Port: $SSH_PORT"
 echo
