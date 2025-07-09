@@ -44,6 +44,9 @@ for P in K1 K2 K3 PORT_VLESS PORT_TROJAN PORT_HYSTERIA; do
   fi
 done
 
+echo
+read -rp "Install XanMod kernel for BBRv3 and other optimizations? [y/N]: " INSTALL_XANMOD
+
 # 3. Pre-flight Checks & Confirmation
 echo -e "\n${GREEN}--- Pre-flight Checks ---${NC}"
 SSH_PORT=$(ss -tnlp | awk '/sshd/ && /LISTEN/ { sub(".*:", "", $4); print $4; exit }')
@@ -69,6 +72,9 @@ echo "VLESS Port (TCP):   $PORT_VLESS"
 echo "Trojan Port (TCP):  $PORT_TROJAN"
 echo "Hysteria2 Port (UDP):$PORT_HYSTERIA"
 echo "Knock Ports:        $K1, $K2, $K3"
+if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
+    echo "Install XanMod:     Yes"
+fi
 echo -e "${YELLOW}----------------------------${NC}\n"
 
 read -rp "Proceed with installation? [y/N]: " CONFIRM
@@ -84,7 +90,16 @@ PASSWORD_HYSTERIA=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
 PASSWORD_HYSTERIA_OBFS=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
 WEBPATH_TROJAN=$(head -c64 /dev/urandom | tr -dc 'A-Za-z0-9')
 
-# 5. Install dependencies
+# 5. Install XanMod Kernel (if requested)
+if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
+    echo -e "\n${GREEN}--- Setting up XanMod Repository ---${NC}"
+    apt update
+    apt install -y wget gpg
+    echo 'deb http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-kernel.list
+    wget -qO - https://dl.xanmod.org/gpg.key | gpg --dearmor -o /etc/apt/trusted.gpg.d/xanmod-kernel.gpg
+fi
+
+# 6. Install dependencies
 echo -e "\n${GREEN}--- Installing Dependencies ---${NC}"
 echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
 echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
@@ -92,9 +107,42 @@ apt update
 apt install -y \
   curl wget unzip jq iptables ipset certbot qrencode \
   python3-certbot-dns-cloudflare \
-  uuid-runtime openssl socat iptables-persistent
+  uuid-runtime openssl socat iptables-persistent gawk
 
-# 6. Write raycontrol CLI
+# Install detected XanMod kernel version
+if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
+    echo -e "\n${GREEN}--- Checking CPU microarchitecture level ---${NC}"
+    cat > /tmp/check_x86_v_level.awk <<'AWK'
+#!/usr/bin/awk -f
+BEGIN {
+    while (!/flags/) if (getline < "/proc/cpuinfo" != 1) exit 1
+    if (/lm/&&/cmov/&&/cx8/&&/fpu/&&/fxsr/&&/mmx/&&/syscall/&&/sse2/) level = 1
+    if (level == 1 && /cx16/&&/lahf/&&/popcnt/&&/sse4_1/&&/sse4_2/&&/ssse3/) level = 2
+    if (level == 2 && /avx/&&/avx2/&&/bmi1/&&/bmi2/&&/f16c/&&/fma/&&/abm/&&/movbe/&&/xsave/) level = 3
+    if (level == 3 && /avx512f/&&/avx512bw/&&/avx512cd/&&/avx512dq/&&/avx512vl/) level = 4
+    if (level > 0) { print "CPU supports x86-64-v" level; exit level + 1 }
+    exit 1
+}
+AWK
+    chmod +x /tmp/check_x86_v_level.awk
+    
+    XANMOD_PKG_NAME="linux-xanmod-lts-x64v1" # Default
+    CPU_LEVEL_EXIT_CODE=0
+    /tmp/check_x86_v_level.awk || CPU_LEVEL_EXIT_CODE=$?
+    
+    case $CPU_LEVEL_EXIT_CODE in
+        3) XANMOD_PKG_NAME="linux-xanmod-x64v2" ;;
+        4) XANMOD_PKG_NAME="linux-xanmod-x64v3" ;;
+        5) XANMOD_PKG_NAME="linux-xanmod-x64v3" ;;
+        *) XANMOD_PKG_NAME="linux-xanmod-lts-x64v1" ;;
+    esac
+    
+    echo -e "\n${GREEN}--- Installing XanMod Kernel ($XANMOD_PKG_NAME) ---${NC}"
+    apt install -y "$XANMOD_PKG_NAME"
+    rm -f /tmp/check_x86_v_level.awk
+fi
+
+# 7. Write raycontrol CLI
 cat > /usr/local/bin/raycontrol <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -202,7 +250,7 @@ esac
 EOF
 chmod +x /usr/local/bin/raycontrol
 
-# 7. Prepare Apply-Firewall script
+# 8. Prepare Apply-Firewall script
 cat > /usr/local/bin/apply_iptables_xray.sh <<EOF
 #!/usr/bin/env bash
 set -e
@@ -230,7 +278,7 @@ done
 EOF
 chmod +x /usr/local/bin/apply_iptables_xray.sh
 
-# 8. Certificate issuance
+# 9. Certificate issuance
 echo -e "\n${GREEN}--- Issuing Certificate with Certbot ---${NC}"
 mkdir -p /root/.secrets
 cat > /root/.secrets/cloudflare.ini <<EOF
@@ -244,19 +292,19 @@ certbot certonly \
   -m "$EMAIL" \
   -d "$DOMAIN"
 
-# 9. Create Certbot renewal hook
+# 10. Create Certbot renewal hook
 echo -e "\n${GREEN}--- Configuring Automatic Certificate Renewal ---${NC}"
 mkdir -p /etc/letsencrypt/renewal-hooks/post
 cat > /etc/letsencrypt/renewal-hooks/post/reload_services.sh <<'EOF'
 #!/usr/bin/env bash
-if [[ "$(cat /etc/xray/enabled.flag)" == "enabled" ]]; then
+if [[ -f /etc/xray/enabled.flag && "$(cat /etc/xray/enabled.flag)" == "enabled" ]]; then
     systemctl restart xray
     systemctl restart hysteria-server
 fi
 EOF
 chmod +x /etc/letsencrypt/renewal-hooks/post/reload_services.sh
 
-# 10. Install Xray-core
+# 11. Install Xray-core
 echo -e "\n${GREEN}--- Installing Xray-core ---${NC}"
 mkdir -p /etc/xray /var/log/xray
 chown -R nobody:nogroup /etc/xray /var/log/xray
@@ -264,7 +312,7 @@ XRAY_VER=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest |
 wget -qO- "https://github.com/XTLS/Xray-core/releases/download/$XRAY_VER/Xray-linux-64.zip" | funzip >/usr/local/bin/xray
 chmod +x /usr/local/bin/xray
 
-# 11. Configure Xray
+# 12. Configure Xray
 cat > /etc/xray/config.json <<EOF
 {
   "log": {"loglevel": "warning"},
@@ -285,7 +333,7 @@ cat > /etc/xray/config.json <<EOF
 }
 EOF
 
-# 12. Setup Xray systemd service
+# 13. Setup Xray systemd service
 cat > /etc/systemd/system/xray.service <<EOF
 [Unit]
 Description=Xray Service
@@ -301,13 +349,13 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 
-# 13. Install Hysteria2
+# 14. Install Hysteria2
 echo -e "\n${GREEN}--- Installing Hysteria2 ---${NC}"
 HY_VER=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r .tag_name | sed 's/v//')
 wget -qO /usr/local/bin/hysteria-server "https://github.com/apernet/hysteria/releases/download/v$HY_VER/hysteria-linux-amd64"
 chmod +x /usr/local/bin/hysteria-server
 
-# 14. Configure Hysteria2
+# 15. Configure Hysteria2
 mkdir -p /etc/hysteria
 cat > /etc/hysteria/config.yaml <<EOF
 listen: :$PORT_HYSTERIA
@@ -327,7 +375,7 @@ masquerade:
     rewriteHost: true
 EOF
 
-# 15. Setup Hysteria2 systemd service
+# 16. Setup Hysteria2 systemd service
 cat > /etc/systemd/system/hysteria-server.service <<EOF
 [Unit]
 Description=Hysteria2 Service
@@ -343,13 +391,13 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 
-# 16. Finalize installation
+# 17. Finalize installation
 systemctl daemon-reload
 systemctl enable xray
 systemctl enable hysteria-server
 echo -e "\n${GREEN}--- Installation of all files is complete. ---${NC}"
 
-# 17. Final Info
+# 18. Final Info
 VLESS_URI="vless://${UUID_VLESS}@${DOMAIN}:${PORT_VLESS}?type=tcp&security=xtls&flow=xtls-rprx-vision&alpn=h2&sni=${DOMAIN}#${DOMAIN}-VLESS"
 TROJAN_URI="trojan://${PASSWORD_TROJAN}@${DOMAIN}:${PORT_TROJAN}?alpn=h2&sni=${DOMAIN}#${DOMAIN}-Trojan"
 HYSTERIA_URI="hysteria2://${PASSWORD_HYSTERIA}@${DOMAIN}:${PORT_HYSTERIA}?sni=${DOMAIN}&obfs=password&obfs-password=${PASSWORD_HYSTERIA_OBFS}#${DOMAIN}-Hysteria2"
@@ -358,11 +406,17 @@ echo -e "\n\n${YELLOW}=====================================================${NC}
 echo -e "${YELLOW}               ACTION REQUIRED TO ACTIVATE               ${NC}"
 echo -e "${YELLOW}=====================================================${NC}\n"
 
-echo -e "Services are installed but NOT RUNNING. The firewall is NOT ACTIVE."
-echo -e "To start all services and apply the firewall for the first time, run:\n"
-echo -e "  ${GREEN}raycontrol enable${NC}\n"
+if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
+    echo -e "${YELLOW}IMPORTANT: A reboot is required to use the new XanMod kernel.${NC}"
+    echo -e "After rebooting, run 'raycontrol enable'.\n"
+else
+    echo -e "Services are installed but NOT RUNNING. The firewall is NOT ACTIVE."
+    echo -e "To start all services and apply the firewall, run:\n"
+    echo -e "  ${GREEN}raycontrol enable${NC}\n"
+fi
 echo -e "After enabling, your system will be fully configured and ready."
 echo -e "Your IP will not be whitelisted automatically. You must perform the port knock first."
+
 echo -e "\n${YELLOW}--- Connection Info (once enabled) ---${NC}"
 echo "Knock sequence for all services: $K1 -> $K2 -> $K3"
 echo "SSH Port: $SSH_PORT"
