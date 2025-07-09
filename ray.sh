@@ -88,7 +88,8 @@ apt update
 apt install -y \
   curl wget unzip jq iptables ipset certbot qrencode \
   python3-certbot-dns-cloudflare \
-  uuid-runtime openssl socat iptables-persistent gawk dnsutils uuid uuid-dev uuid-runtime uuidcdef
+  uuid-runtime openssl socat iptables-persistent gawk \
+  dnsutils uuid uuid-dev uuid-runtime uuidcdef ssl-cert
 
 if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
     echo -e "\n${GREEN}--- Setting up XanMod Repository ---${NC}"
@@ -164,11 +165,6 @@ if [[ "$RESOLVED_IP" != "$SERVER_IP" ]]; then
     exit 1
 fi
 echo -e "${GREEN}DNS validation successful!${NC}"
-
-echo -e "\n${GREEN}--- Creating dedicated group for certificate access ---${NC}"
-groupadd --system certs-access || echo "Group 'certs-access' already exists."
-usermod -a -G certs-access nobody
-echo "Added user 'nobody' to 'certs-access' group for secure certificate reading."
 
 # 7. Write raycontrol CLI
 cat > /usr/local/bin/raycontrol <<'EOF'
@@ -437,6 +433,11 @@ WantedBy=multi-user.target
 EOF
 
 # 17. Finalize installation
+
+usermod -aG ssl-cert nobody
+chgrp -R ssl-cert /etc/letsencrypt/live /etc/letsencrypt/archive
+chmod -R g+rx /etc/letsencrypt/live /etc/letsencrypt/archive
+
 systemctl daemon-reload
 systemctl enable xray
 systemctl enable hysteria-server
