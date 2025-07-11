@@ -420,7 +420,12 @@ show_status(){
         local counter="$1"
         local bytes
         bytes=$(nft -j list ruleset | jq -r ".nftables[] | select(.rule) | .rule | select(.comment == \"$counter\") | .bytes")
-        if [[ -n "$bytes" && "$bytes" -gt 0 ]]; then
+
+        if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
+            bytes=0
+        fi
+
+        if [[ "$bytes" -gt 0 ]]; then
             numfmt --to=iec-i --suffix=B --format="%.2f" "$bytes"
         else
             echo "0.00B"
