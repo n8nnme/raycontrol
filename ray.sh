@@ -6,6 +6,58 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
+trap 'cleanup' ERR EXIT
+
+cleanup() {
+    set +e
+    echo -e "\n${RED}--- An error occurred. Rolling back changes... ---${NC}"
+    
+    if systemctl is-active --quiet nftables; then
+        echo "Flushing firewall rules..."
+        nft flush ruleset
+    fi
+
+    if command -v xray &> /dev/null; then
+        systemctl disable --now xray &>/dev/null
+        rm -f /usr/local/bin/xray /etc/systemd/system/xray.service
+    fi
+    
+    if command -v hysteria-server &> /dev/null; then
+        systemctl disable --now hysteria-server &>/dev/null
+        rm -f /usr/local/bin/hysteria-server /etc/systemd/system/hysteria-server.service
+    fi
+
+    systemctl daemon-reload
+
+    echo "Removing configuration directories..."
+    rm -rf /etc/ray-aio /etc/xray /etc/hysteria /root/.secrets
+    
+    if [[ -n "${XANMOD_PKG_NAME_INSTALLED:-}" ]]; then
+        echo "Uninstalling XanMod Kernel package: ${XANMOD_PKG_NAME_INSTALLED}"
+        apt-get remove -y "$XANMOD_PKG_NAME_INSTALLED"
+    fi
+
+    echo "Removing temporary files..."
+    rm -f /tmp/check_x86_v_level.awk /tmp/Xray-linux-64.zip
+
+    echo -e "${YELLOW}Rollback complete. The system should be in its original state.${NC}"
+    exit 1
+}
+
+validate_port() {
+    local port_val="$1"
+    local port_name="$2"
+    local min_val="${3:-1}"
+    if ! [[ "$port_val" =~ ^[1-9][0-9]*$ ]]; then
+        echo -e "${RED}ERROR: Port '$port_name' ($port_val) is not a valid number.${NC}" >&2
+        exit 1
+    fi
+    if (( port_val < min_val || port_val > 65535 )); then
+        echo -e "${RED}ERROR: Port '$port_name' ($port_val) must be between $min_val and 65535.${NC}" >&2
+        exit 1
+    fi
+}
+
 if [[ $EUID -ne 0 ]]; then
   echo -e "${RED}ERROR: This script must be run as root.${NC}" >&2
   exit 1
@@ -15,14 +67,22 @@ read -rp "Domain (e.g. your.domain.com): " DOMAIN
 read -rp "Cloudflare API Token: " CF_API_TOKEN
 read -rp "Let’s Encrypt email: " EMAIL
 
+echo -e "\n${GREEN}--- Verifying Cloudflare API Token ---${NC}"
+CF_ZONE_ID_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN" \
+  -H "Authorization: Bearer $CF_API_TOKEN" \
+  -H "Content-Type: application/json")
+
+if ! echo "$CF_ZONE_ID_RESPONSE" | jq -e '.success' &>/dev/null; then
+    ERROR_MSG=$(echo "$CF_ZONE_ID_RESPONSE" | jq -r '.errors[0].message' 2>/dev/null || echo "Unknown error")
+    echo -e "${RED}ERROR: Cloudflare API token is invalid or lacks 'Zone.Read' permissions.${NC}" >&2
+    echo -e "${RED}API response: $ERROR_MSG${NC}" >&2
+    exit 1
+fi
+echo -e "${GREEN}Cloudflare API Token appears to be valid.${NC}"
+
 echo
 echo -e "${YELLOW}Specify three distinct TCP ports for Port Knocking (e.g. 10001 10002 10003):${NC}"
 read -rp "Knock ports: " K1 K2 K3
-
-if [[ "$K1" == "$K2" || "$K2" == "$K3" || "$K1" == "$K3" || -z "$K1" || -z "$K2" || -z "$K3" ]]; then
-  echo -e "${RED}ERROR: Knock ports must be three distinct numbers.${NC}" >&2
-  exit 1
-fi
 
 read -rp "Port for VLESS/XTLS (TCP, 200–65535, default 443): " PORT_VLESS
 PORT_VLESS=${PORT_VLESS:-443}
@@ -31,13 +91,17 @@ PORT_TROJAN=${PORT_TROJAN:-8443}
 read -rp "Port for Hysteria2 (UDP, 200-65535, default 3478): " PORT_HYSTERIA
 PORT_HYSTERIA=${PORT_HYSTERIA:-3478}
 
-for P in K1 K2 K3 PORT_VLESS PORT_TROJAN PORT_HYSTERIA; do
-  VAL=${!P}
-  if ! [[ "$VAL" =~ ^[0-9]+$ ]] || (( VAL<1 || VAL>65535 )); then
-    echo -e "${RED}ERROR: Port $P ($VAL) must be a number between 1 and 65535.${NC}" >&2
-    exit 1
-  fi
-done
+validate_port "$K1" "K1"
+validate_port "$K2" "K2"
+validate_port "$K3" "K3"
+if [[ "$K1" == "$K2" || "$K2" == "$K3" || "$K1" == "$K3" ]]; then
+  echo -e "${RED}ERROR: Knock ports must be three distinct numbers.${NC}" >&2
+  exit 1
+fi
+
+validate_port "$PORT_VLESS" "PORT_VLESS" 200
+validate_port "$PORT_TROJAN" "PORT_TROJAN" 200
+validate_port "$PORT_HYSTERIA" "PORT_HYSTERIA" 200
 
 echo
 read -rp "Install XanMod kernel for BBRv3 and other optimizations? [y/N]: " INSTALL_XANMOD
@@ -46,8 +110,8 @@ echo -e "\n${GREEN}--- Pre-flight Checks ---${NC}"
 SSH_PORT=$(ss -tnlp | awk '/sshd/ && /LISTEN/ { sub(".*:", "", $4); print $4; exit }')
 echo "Detected SSH port: $SSH_PORT"
 
-for P in PORT_VLESS PORT_TROJAN; do
-    VAL=${!P}
+for P_VAR in PORT_VLESS PORT_TROJAN; do
+    VAL=${!P_VAR}
     if ss -tlpn | grep -q ":$VAL\s"; then
         echo -e "${RED}ERROR: TCP Port $VAL is already in use.${NC}" >&2
         exit 1
@@ -74,12 +138,13 @@ echo -e "${YELLOW}----------------------------${NC}\n"
 read -rp "Proceed with installation? [y/N]: " CONFIRM
 if [[ "${CONFIRM,,}" != "y" ]]; then
     echo "Installation cancelled."
+    trap - ERR EXIT
     exit 1
 fi
 
 echo -e "\n${GREEN}--- Installing Core Dependencies ---${NC}"
-apt update
-apt install -y \
+apt-get update
+apt-get install -y \
   curl wget unzip jq nftables certbot qrencode \
   python3-certbot-dns-cloudflare \
   uuid-runtime openssl socat gawk \
@@ -101,11 +166,11 @@ EOF
 
 if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
     echo -e "\n${GREEN}--- Setting up XanMod Repository ---${NC}"
-    apt install -y gpg
+    apt-get install -y gpg
     echo 'deb http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-kernel.list
     wget -qO - https://dl.xanmod.org/gpg.key | gpg --dearmor -o /etc/apt/trusted.gpg.d/xanmod-kernel.gpg
     echo -e "\n${GREEN}--- Updating sources for XanMod ---${NC}"
-    apt update
+    apt-get update
     echo -e "\n${GREEN}--- Checking CPU microarchitecture level ---${NC}"
     cat > /tmp/check_x86_v_level.awk <<'AWK'
 #!/usr/bin/awk -f
@@ -130,7 +195,8 @@ AWK
         *) XANMOD_PKG_NAME="linux-xanmod-lts-x64v1" ;;
     esac
     echo -e "\n${GREEN}--- Installing XanMod Kernel ($XANMOD_PKG_NAME) ---${NC}"
-    apt install -y "$XANMOD_PKG_NAME"
+    apt-get install -y "$XANMOD_PKG_NAME"
+    XANMOD_PKG_NAME_INSTALLED=$XANMOD_PKG_NAME
     rm -f /tmp/check_x86_v_level.awk
 fi
 
@@ -138,7 +204,6 @@ UUID_VLESS=$(uuidgen)
 PASSWORD_TROJAN=$(head -c16 /dev/urandom | base64 | tr '+/' '_-' | cut -c1-16)
 PASSWORD_HYSTERIA=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
 PASSWORD_HYSTERIA_OBFS=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
-WEBPATH_TROJAN=$(head -c64 /dev/urandom | tr -dc 'A-Za-z0-9')
 
 echo -e "\n${GREEN}--- Validating DNS Records ---${NC}"
 SERVER_IP=$(curl -s https://ipwho.de/ip)
@@ -161,32 +226,30 @@ if [[ "$RESOLVED_IP" != "$SERVER_IP" ]]; then
     exit 1
 fi
 echo -e "${GREEN}DNS validation successful!${NC}"
+
 cat > /usr/local/bin/raycontrol <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- Configuration Variables ---
 XCONF="/etc/xray/config.json"
 NFT_TABLE="inet filter"
 NFT_SET="xray_clients"
 DB_XRAY_USERS="/etc/xray/users.db"
-DB_HY_USERS="/etc/hysteria/users.db" # MODIFICATION: Hysteria user DB
+DB_HY_USERS="/etc/hysteria/users.db"
 DB_IPS="/etc/xray/ips.db"
 ENABLED_FLAG="/etc/xray/enabled.flag"
 BACKUP_DIR="/var/backups/ray-aio"
 INSTALL_CONF="/etc/ray-aio/install.conf"
 HYSTERIA_CONF="/etc/hysteria/config.yaml"
 
-# --- Color Codes ---
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-# --- Helper Functions ---
 ensure_db(){
-    mkdir -p /etc/xray /etc/hysteria "$BACKUP_DIR" # MODIFICATION: Create /etc/hysteria
-    touch "$DB_XRAY_USERS" "$DB_HY_USERS" "$DB_IPS" # MODIFICATION: Touch Hysteria DB
+    mkdir -p /etc/xray /etc/hysteria "$BACKUP_DIR"
+    touch "$DB_XRAY_USERS" "$DB_HY_USERS" "$DB_IPS"
     if [ ! -f "$ENABLED_FLAG" ]; then
         echo "disabled" > "$ENABLED_FLAG"
     fi
@@ -194,7 +257,6 @@ ensure_db(){
 
 reload_services(){
     if [[ "$(cat "$ENABLED_FLAG")" == "enabled" ]]; then
-        # Reload only the relevant service
         case "$1" in
             xray) systemctl restart xray; echo -e "${GREEN}Xray service reloaded.${NC}" ;;
             hysteria) systemctl restart hysteria-server; echo -e "${GREEN}Hysteria2 service reloaded.${NC}" ;;
@@ -203,7 +265,6 @@ reload_services(){
     fi
 }
 
-# --- QR Code Generation ---
 show_qr() {
     local type="$1"
     local id="$2"
@@ -230,7 +291,6 @@ show_qr() {
             uri="trojan://${id}@${DOMAIN}:${PORT_TROJAN}?alpn=h2&sni=${DOMAIN}#${name}"
             ;;
         hysteria)
-            # MODIFICATION: Handle Hysteria QR code generation for a specific user
             if [[ -z "$id" ]]; then
                 echo -e "${RED}ERROR: Please provide a Hysteria password to generate a QR code.${NC}" >&2; exit 1;
             fi
@@ -251,7 +311,6 @@ show_qr() {
     echo -e "${YELLOW}URI: ${uri}${NC}\n"
 }
 
-# --- User Management ---
 add_user(){
     local type="$1"
     if [[ "$type" == "vless" ]]; then
@@ -274,7 +333,6 @@ add_user(){
         echo -e "${GREEN}Added Trojan user. Password: $pass${NC}"
         reload_services xray
         show_qr trojan "$pass"
-    # MODIFICATION: Add Hysteria user
     elif [[ "$type" == "hysteria" ]]; then
         local pass
         pass=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
@@ -290,16 +348,13 @@ add_user(){
 
 del_user(){
     local id="$1"
-    # MODIFICATION: Differentiate between deleting an Xray user and a Hysteria user
     if grep -qE "^(vless|trojan):$id" "$DB_XRAY_USERS"; then
-        # It's an Xray user
         sed -i "\%^.*:$id.*%d" "$DB_XRAY_USERS"
         jq "del(.inbounds[] | .settings.clients[]? | select(.id == \"$id\" or .password == \"$id\"))" \
            "$XCONF" > "$XCONF.tmp" && mv "$XCONF.tmp" "$XCONF"
         echo "Removed Xray user: $id"
         reload_services xray
     elif grep -qFx "$id" "$DB_HY_USERS"; then
-        # It's a Hysteria user (password)
         sed -i "\%^${id}\$%d" "$DB_HY_USERS"
         echo "Removed Hysteria2 user: $id"
         reload_services hysteria
@@ -331,7 +386,6 @@ list_users(){
     fi
 }
 
-# --- Core System Management Placeholder ---
 list_ips(){ echo "Function list_ips placeholder"; }
 check_conns(){ echo "Function check_conns placeholder"; }
 add_ip(){ echo "Function add_ip placeholder"; }
@@ -343,7 +397,6 @@ backup_config(){ echo "Function backup_config placeholder"; }
 restore_config(){ echo "Function restore_config placeholder"; }
 show_status(){ echo "Function show_status placeholder"; }
 
-# --- Help and Main Dispatcher ---
 help(){
     cat <<MSG
 Usage: raycontrol <command> [args]
@@ -395,6 +448,7 @@ case "${1:-help}" in
 esac
 EOF
 chmod +x /usr/local/bin/raycontrol
+
 cat > /usr/local/bin/apply_nftables_xray.sh <<EOF
 #!/usr/bin/env bash
 set -e
@@ -415,10 +469,10 @@ nft add set inet filter knock_stage2 '{ type ipv4_addr; flags dynamic; timeout 1
 nft add set inet filter xray_clients '{ type ipv4_addr; flags dynamic; timeout 10m; }'
 nft add chain inet filter knock
 nft add rule inet filter input iif lo accept
-nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_VLESS counter update @xray_clients '{ ip saddr }' accept comment "vless_bw"
-nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_TROJAN counter update @xray_clients '{ ip saddr }' accept comment "trojan_bw"
-nft add rule inet filter input ip saddr @xray_clients udp dport $PORT_HYSTERIA counter update @xray_clients '{ ip saddr }' accept comment "hysteria_bw"
-nft add rule inet filter input ip saddr @xray_clients tcp dport $SSH_PORT counter update @xray_clients '{ ip saddr }' accept comment "ssh_bw"
+nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_VLESS counter update @xray_clients '{ ip saddr }' accept
+nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_TROJAN counter update @xray_clients '{ ip saddr }' accept
+nft add rule inet filter input ip saddr @xray_clients udp dport $PORT_HYSTERIA counter update @xray_clients '{ ip saddr }' accept
+nft add rule inet filter input ip saddr @xray_clients tcp dport $SSH_PORT counter update @xray_clients '{ ip saddr }' accept
 nft add rule inet filter input ct state established,related accept
 nft add rule inet filter input ip protocol icmp accept
 nft add rule inet filter input ip6 nexthdr ipv6-icmp accept
@@ -458,9 +512,9 @@ echo -e "\n${GREEN}--- Installing Xray-core ---${NC}"
 mkdir -p /etc/xray /var/log/xray
 chown -R nobody:nogroup /etc/xray /var/log/xray
 XRAY_VER=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
-wget -qO /tmp/Xray-linux-64.zip "https://github.com/XTLS/Xray-core/releases/download/$XRAY_VER/Xray-linux-64.zip" \
-  && sudo unzip -qo /tmp/Xray-linux-64.zip -d /usr/local/bin \
-  && rm /tmp/Xray-linux-64.zip
+wget -qO /tmp/Xray-linux-64.zip "https://github.com/XTLS/Xray-core/releases/download/$XRAY_VER/Xray-linux-64.zip"
+unzip -qo /tmp/Xray-linux-64.zip -d /usr/local/bin
+rm /tmp/Xray-linux-64.zip
 chmod +x /usr/local/bin/xray
 
 cat > /etc/xray/config.json <<EOF
@@ -484,7 +538,6 @@ EOF
 echo "vless:$UUID_VLESS" > /etc/xray/users.db
 echo "trojan:$PASSWORD_TROJAN" >> /etc/xray/users.db
 
-
 cat > /etc/systemd/system/xray.service <<EOF
 [Unit]
 Description=Xray Service
@@ -501,18 +554,10 @@ WantedBy=multi-user.target
 EOF
 
 echo -e "\n${GREEN}--- Installing Hysteria2 ---${NC}"
-
 RAW_TAG=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r .tag_name)
 ENC_TAG=${RAW_TAG//\//%2F}
 DOWNLOAD_URL="https://github.com/apernet/hysteria/releases/download/${ENC_TAG}/hysteria-linux-amd64"
-
-if wget -nv -O /usr/local/bin/hysteria-server "$DOWNLOAD_URL"; then
-  echo -e "${GREEN}Downloaded hysteria-server (${RAW_TAG})${NC}"
-else
-  echo -e "${RED}Failed to download hysteria-server from ${DOWNLOAD_URL}${NC}" >&2
-  exit 1
-fi
-
+wget -nv -O /usr/local/bin/hysteria-server "$DOWNLOAD_URL"
 chmod +x /usr/local/bin/hysteria-server
 echo -e "${GREEN}Hysteria2 installed successfully!${NC}"
 
@@ -561,11 +606,13 @@ chmod -R g+rx /etc/letsencrypt/live /etc/letsencrypt/archive
 systemctl daemon-reload
 systemctl enable xray
 systemctl enable hysteria-server
-echo -e "\n${GREEN}--- Installation of all files is complete. ---${NC}"
 
 VLESS_URI="vless://${UUID_VLESS}@${DOMAIN}:${PORT_VLESS}?type=tcp&security=xtls&flow=xtls-rprx-vision&alpn=h2&sni=${DOMAIN}#${DOMAIN}-VLESS"
 TROJAN_URI="trojan://${PASSWORD_TROJAN}@${DOMAIN}:${PORT_TROJAN}?alpn=h2&sni=${DOMAIN}#${DOMAIN}-Trojan"
 HYSTERIA_URI="hysteria2://${PASSWORD_HYSTERIA}@${DOMAIN}:${PORT_HYSTERIA}?sni=${DOMAIN}&obfs=salamander&obfs-password=${PASSWORD_HYSTERIA_OBFS}#${DOMAIN}-Hysteria2"
+
+trap - ERR EXIT
+echo -e "\n${GREEN}--- Installation successful! ---${NC}"
 
 echo -e "\n\n${YELLOW}=====================================================${NC}"
 echo -e "${YELLOW}               ACTION REQUIRED TO ACTIVATE               ${NC}"
