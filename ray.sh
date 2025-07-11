@@ -104,10 +104,8 @@ if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
     apt install -y gpg
     echo 'deb http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-kernel.list
     wget -qO - https://dl.xanmod.org/gpg.key | gpg --dearmor -o /etc/apt/trusted.gpg.d/xanmod-kernel.gpg
-
     echo -e "\n${GREEN}--- Updating sources for XanMod ---${NC}"
     apt update
-
     echo -e "\n${GREEN}--- Checking CPU microarchitecture level ---${NC}"
     cat > /tmp/check_x86_v_level.awk <<'AWK'
 #!/usr/bin/awk -f
@@ -122,18 +120,15 @@ BEGIN {
 }
 AWK
     chmod +x /tmp/check_x86_v_level.awk
-
     XANMOD_PKG_NAME="linux-xanmod-lts-x64v1"
     CPU_LEVEL_EXIT_CODE=0
     /tmp/check_x86_v_level.awk || CPU_LEVEL_EXIT_CODE=$?
-
     case $CPU_LEVEL_EXIT_CODE in
         3) XANMOD_PKG_NAME="linux-xanmod-x64v2" ;;
         4) XANMOD_PKG_NAME="linux-xanmod-x64v3" ;;
         5) XANMOD_PKG_NAME="linux-xanmod-x64v3" ;;
         *) XANMOD_PKG_NAME="linux-xanmod-lts-x64v1" ;;
     esac
-
     echo -e "\n${GREEN}--- Installing XanMod Kernel ($XANMOD_PKG_NAME) ---${NC}"
     apt install -y "$XANMOD_PKG_NAME"
     rm -f /tmp/check_x86_v_level.awk
@@ -154,16 +149,11 @@ fi
 echo "This server's public IP is: $SERVER_IP"
 echo "Please ensure you have an A record for $DOMAIN pointing to this IP in your Cloudflare DNS."
 echo "Waiting 60 seconds for DNS to propagate..."
-
-for i in {60..1}; do
-    printf "\rWaiting... %2d" "$i"
-    sleep 1
-done
+for i in {60..1}; do printf "\rWaiting... %2d" "$i"; sleep 1; done
 echo -e "\rDone waiting. Now checking DNS resolution.${NC}"
 
 RESOLVED_IP=$(dig +short "$DOMAIN" @1.1.1.1 || echo "")
 echo "Resolved IP for $DOMAIN is: ${YELLOW}${RESOLVED_IP:-Not found}${NC}"
-
 if [[ "$RESOLVED_IP" != "$SERVER_IP" ]]; then
     echo -e "\n${RED}ERROR: DNS validation failed!${NC}" >&2
     echo "The domain ${YELLOW}$DOMAIN${NC} does not resolve to this server's IP (${YELLOW}$SERVER_IP${NC})." >&2
@@ -171,7 +161,6 @@ if [[ "$RESOLVED_IP" != "$SERVER_IP" ]]; then
     exit 1
 fi
 echo -e "${GREEN}DNS validation successful!${NC}"
-
 cat > /usr/local/bin/raycontrol <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -180,7 +169,8 @@ set -euo pipefail
 XCONF="/etc/xray/config.json"
 NFT_TABLE="inet filter"
 NFT_SET="xray_clients"
-DB_USERS="/etc/xray/users.db"
+DB_XRAY_USERS="/etc/xray/users.db"
+DB_HY_USERS="/etc/hysteria/users.db" # MODIFICATION: Hysteria user DB
 DB_IPS="/etc/xray/ips.db"
 ENABLED_FLAG="/etc/xray/enabled.flag"
 BACKUP_DIR="/var/backups/ray-aio"
@@ -195,17 +185,21 @@ NC='\033[0m'
 
 # --- Helper Functions ---
 ensure_db(){
-    mkdir -p /etc/xray "$BACKUP_DIR"
-    touch "$DB_USERS" "$DB_IPS"
+    mkdir -p /etc/xray /etc/hysteria "$BACKUP_DIR" # MODIFICATION: Create /etc/hysteria
+    touch "$DB_XRAY_USERS" "$DB_HY_USERS" "$DB_IPS" # MODIFICATION: Touch Hysteria DB
     if [ ! -f "$ENABLED_FLAG" ]; then
         echo "disabled" > "$ENABLED_FLAG"
     fi
 }
 
-reload_xray(){
+reload_services(){
     if [[ "$(cat "$ENABLED_FLAG")" == "enabled" ]]; then
-        systemctl restart xray
-        echo -e "${GREEN}Xray service reloaded.${NC}"
+        # Reload only the relevant service
+        case "$1" in
+            xray) systemctl restart xray; echo -e "${GREEN}Xray service reloaded.${NC}" ;;
+            hysteria) systemctl restart hysteria-server; echo -e "${GREEN}Hysteria2 service reloaded.${NC}" ;;
+            *) systemctl restart xray; systemctl restart hysteria-server; echo -e "${GREEN}All services reloaded.${NC}" ;;
+        esac
     fi
 }
 
@@ -236,14 +230,17 @@ show_qr() {
             uri="trojan://${id}@${DOMAIN}:${PORT_TROJAN}?alpn=h2&sni=${DOMAIN}#${name}"
             ;;
         hysteria)
-            local hy_pass obfs_pass
-            hy_pass=$(awk '/^auth:$/,/password:/ {if ($1 == "password:") {print $2}}' "$HYSTERIA_CONF" | head -n 1)
-            obfs_pass=$(awk '/^obfs:$/,/password:/ {if ($1 == "password:") {print $2}}' "$HYSTERIA_CONF" | tail -n 1)
-            if [[ -z "$hy_pass" || -z "$obfs_pass" ]]; then
-                echo -e "${RED}ERROR: Could not read Hysteria passwords from $HYSTERIA_CONF${NC}" >&2; exit 1;
+            # MODIFICATION: Handle Hysteria QR code generation for a specific user
+            if [[ -z "$id" ]]; then
+                echo -e "${RED}ERROR: Please provide a Hysteria password to generate a QR code.${NC}" >&2; exit 1;
             fi
-            name="${DOMAIN}-Hysteria2"
-            uri="hysteria2://${hy_pass}@${DOMAIN}:${PORT_HYSTERIA}?sni=${DOMAIN}&obfs=salamander&obfs-password=${obfs_pass}#${name}"
+            local obfs_pass
+            obfs_pass=$(awk '/salamander:/,/password:/ {if ($1 == "password:") {print $2; exit}}' "$HYSTERIA_CONF")
+            if [[ -z "$obfs_pass" ]]; then
+                echo -e "${RED}ERROR: Could not read Hysteria OBFS password from $HYSTERIA_CONF${NC}" >&2; exit 1;
+            fi
+            name="${DOMAIN}-Hysteria2-${id:0:6}"
+            uri="hysteria2://${id}@${DOMAIN}:${PORT_HYSTERIA}?sni=${DOMAIN}&obfs=salamander&obfs-password=${obfs_pass}#${name}"
             ;;
         *)
             echo -e "${RED}Invalid type specified for QR code generation.${NC}" >&2; return 1;;
@@ -254,7 +251,6 @@ show_qr() {
     echo -e "${YELLOW}URI: ${uri}${NC}\n"
 }
 
-
 # --- User Management ---
 add_user(){
     local type="$1"
@@ -264,46 +260,49 @@ add_user(){
         jq --arg id "$uuid" \
            '.inbounds[0].settings.clients += [{"id":$id,"flow":"xtls-rprx-vision"}]' \
            "$XCONF" > "$XCONF.tmp" && mv "$XCONF.tmp" "$XCONF"
-        echo "vless:$uuid" >> "$DB_USERS"
+        echo "vless:$uuid" >> "$DB_XRAY_USERS"
         echo -e "${GREEN}Added VLESS user: $uuid${NC}"
-        reload_xray
+        reload_services xray
         show_qr vless "$uuid"
     elif [[ "$type" == "trojan" ]]; then
-        local pass path
+        local pass
         pass=$(head -c16 /dev/urandom | base64 | tr '+/' '_-' | cut -c1-16)
-        path=$(head -c64 /dev/urandom | tr -dc 'A-Za-z0-9')
-        jq --arg pw "$pass" --arg p "/$path" \
-           '.inbounds[1].settings.clients += [{"password":$pw}] |
-            .inbounds[1].settings.fallbacks += [{"path":$p,"dest":6001,"xver":1}]' \
+        jq --arg pw "$pass" \
+           '.inbounds[1].settings.clients += [{"password":$pw}]' \
            "$XCONF" > "$XCONF.tmp" && mv "$XCONF.tmp" "$XCONF"
-        echo "trojan:$pass:$path" >> "$DB_USERS"
+        echo "trojan:$pass" >> "$DB_XRAY_USERS"
         echo -e "${GREEN}Added Trojan user. Password: $pass${NC}"
-        reload_xray
+        reload_services xray
         show_qr trojan "$pass"
+    # MODIFICATION: Add Hysteria user
+    elif [[ "$type" == "hysteria" ]]; then
+        local pass
+        pass=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
+        echo "$pass" >> "$DB_HY_USERS"
+        echo -e "${GREEN}Added Hysteria2 user. Password: $pass${NC}"
+        reload_services hysteria
+        show_qr hysteria "$pass"
     else
-        echo "Usage: raycontrol add-user [vless|trojan]" >&2
+        echo "Usage: raycontrol add-user [vless|trojan|hysteria]" >&2
         exit 1
     fi
 }
 
 del_user(){
     local id="$1"
-    if grep -qE "^(vless|trojan):$id" "$DB_USERS"; then
-        sed -i "\%^.*:$id.*\$%d" "$DB_USERS"
-        # Complex jq to safely remove user ID/password and associated fallback path if it exists
-        jq "del(.inbounds[1].settings.fallbacks[] | select(.path == \"/$(grep "^trojan:$id" "$DB_USERS" | cut -d: -f3)\")) |
-            .inbounds |= map(
-                if .settings.clients then
-                    .settings.clients |= map(select(
-                        (has(\"id\") and .id != \"$id\") or
-                        (has(\"password\") and .password != \"$id\")
-                    ))
-                else .
-                end
-            )" "$XCONF" > "$XCONF.tmp" && mv "$XCONF.tmp" "$XCONF"
-
-        echo "Removed user: $id"
-        reload_xray
+    # MODIFICATION: Differentiate between deleting an Xray user and a Hysteria user
+    if grep -qE "^(vless|trojan):$id" "$DB_XRAY_USERS"; then
+        # It's an Xray user
+        sed -i "\%^.*:$id.*%d" "$DB_XRAY_USERS"
+        jq "del(.inbounds[] | .settings.clients[]? | select(.id == \"$id\" or .password == \"$id\"))" \
+           "$XCONF" > "$XCONF.tmp" && mv "$XCONF.tmp" "$XCONF"
+        echo "Removed Xray user: $id"
+        reload_services xray
+    elif grep -qFx "$id" "$DB_HY_USERS"; then
+        # It's a Hysteria user (password)
+        sed -i "\%^${id}\$%d" "$DB_HY_USERS"
+        echo "Removed Hysteria2 user: $id"
+        reload_services hysteria
     else
         echo "User not found: $id" >&2
         exit 1
@@ -311,21 +310,28 @@ del_user(){
 }
 
 list_users(){
-    if [[ ! -s "$DB_USERS" ]]; then
+    echo -e "${YELLOW}--- Xray Users (VLESS/Trojan) ---${NC}"
+    if [[ ! -s "$DB_XRAY_USERS" ]]; then
         echo "(none)"
-        return
+    else
+        echo "TYPE    ID/PASSWORD"
+        echo "----------------------------------------"
+        while IFS=":" read -r type id; do
+            printf "%-7s %s\n" "$type" "$id"
+        done < "$DB_XRAY_USERS"
     fi
-    echo "TYPE    ID/PASSWORD"
-    echo "----------------------------------------"
-    while IFS=":" read -r type id _; do
-        printf "%-7s %s\n" "$type" "$id"
-    done < "$DB_USERS"
+
+    echo -e "\n${YELLOW}--- Hysteria2 Users ---${NC}"
+    if [[ ! -s "$DB_HY_USERS" ]]; then
+        echo "(none)"
+    else
+        echo "PASSWORD"
+        echo "--------------------------------"
+        cat "$DB_HY_USERS"
+    fi
 }
 
-# --- Core System Management ---
-# ... (all other functions like list_ips, enable_all, disable_all, backup, restore, status, etc. remain here unchanged)
-# The following is a placeholder for brevity. In your script, all the other functions from the original file should be present here.
-
+# --- Core System Management Placeholder ---
 list_ips(){ echo "Function list_ips placeholder"; }
 check_conns(){ echo "Function check_conns placeholder"; }
 add_ip(){ echo "Function add_ip placeholder"; }
@@ -349,12 +355,12 @@ Services Management:
   monitor        Live monitor the status command (updates every 5s)
 
 User & QR Code Management:
-  list-users     List VLESS/Trojan users
-  add-user <type>  Add a new user and get a QR code. Type: [vless|trojan]
-  del-user <ID>    Delete a user (VLESS UUID or Trojan password)
+  list-users     List all users (VLESS, Trojan, Hysteria2)
+  add-user <type>  Add a new user. Type: [vless|trojan|hysteria]
+  del-user <ID>    Delete a user (VLESS UUID, Trojan pass, or Hysteria2 pass)
   show-qr <type> [ID]
                  Show QR code for a connection.
-                 - For Hysteria: raycontrol show-qr hysteria
+                 - For Hysteria: raycontrol show-qr hysteria <PASSWORD>
                  - For existing user: raycontrol show-qr <vless|trojan> <USER_ID>
 
 Disaster Recovery:
@@ -389,11 +395,9 @@ case "${1:-help}" in
 esac
 EOF
 chmod +x /usr/local/bin/raycontrol
-
 cat > /usr/local/bin/apply_nftables_xray.sh <<EOF
 #!/usr/bin/env bash
 set -e
-
 SSH_PORT="$SSH_PORT"
 PORT_VLESS="$PORT_VLESS"
 PORT_TROJAN="$PORT_TROJAN"
@@ -401,37 +405,26 @@ PORT_HYSTERIA="$PORT_HYSTERIA"
 K1="$K1"
 K2="$K2"
 K3="$K3"
-
 nft flush ruleset
-
 nft add table inet filter
-
 nft add chain inet filter input '{ type filter hook input priority 0; policy drop; }'
 nft add chain inet filter forward '{ type filter hook forward priority 0; policy drop; }'
 nft add chain inet filter output '{ type filter hook output priority 0; policy accept; }'
-
 nft add set inet filter knock_stage1 '{ type ipv4_addr; flags dynamic; timeout 10s; }'
 nft add set inet filter knock_stage2 '{ type ipv4_addr; flags dynamic; timeout 10s; }'
 nft add set inet filter xray_clients '{ type ipv4_addr; flags dynamic; timeout 10m; }'
-
 nft add chain inet filter knock
-
 nft add rule inet filter input iif lo accept
-
 nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_VLESS counter update @xray_clients '{ ip saddr }' accept comment "vless_bw"
 nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_TROJAN counter update @xray_clients '{ ip saddr }' accept comment "trojan_bw"
 nft add rule inet filter input ip saddr @xray_clients udp dport $PORT_HYSTERIA counter update @xray_clients '{ ip saddr }' accept comment "hysteria_bw"
 nft add rule inet filter input ip saddr @xray_clients tcp dport $SSH_PORT counter update @xray_clients '{ ip saddr }' accept comment "ssh_bw"
-
 nft add rule inet filter input ct state established,related accept
-
 nft add rule inet filter input ip protocol icmp accept
 nft add rule inet filter input ip6 nexthdr ipv6-icmp accept
-
 nft add rule inet filter input tcp dport $K1 add @knock_stage1 '{ ip saddr }' drop
 nft add rule inet filter input tcp dport $K2 ip saddr @knock_stage1 add @knock_stage2 '{ ip saddr }' drop
 nft add rule inet filter input tcp dport $K3 ip saddr @knock_stage2 jump knock
-
 nft add rule inet filter knock add @xray_clients '{ ip saddr }'
 nft add rule inet filter knock drop
 EOF
@@ -481,14 +474,16 @@ cat > /etc/xray/config.json <<EOF
     },
     {
       "port": $PORT_TROJAN, "protocol": "trojan",
-      "settings": {"clients": [{"password": "$PASSWORD_TROJAN"}], "fallbacks": [{"path": "/$WEBPATH_TROJAN", "dest": 6001, "xver": 1}, {"dest": "@blackhole"}]},
+      "settings": {"clients": [{"password": "$PASSWORD_TROJAN"}], "fallbacks": [{"dest": "@blackhole"}]},
       "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": {"certificates": [{"certificateFile": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem", "keyFile": "/etc/letsencrypt/live/$DOMAIN/privkey.pem"}], "alpn": ["h2"]}}
-    },
-    {"listen": "127.0.0.1", "port": 6001, "protocol": "trojan", "settings": {"clients": [{"password": "$PASSWORD_TROJAN"}]}}
+    }
   ],
   "outbounds": [{"protocol": "freedom"}, {"protocol": "blackhole", "tag": "@blackhole"}]
 }
 EOF
+echo "vless:$UUID_VLESS" > /etc/xray/users.db
+echo "trojan:$PASSWORD_TROJAN" >> /etc/xray/users.db
+
 
 cat > /etc/systemd/system/xray.service <<EOF
 [Unit]
@@ -507,11 +502,8 @@ EOF
 
 echo -e "\n${GREEN}--- Installing Hysteria2 ---${NC}"
 
-RAW_TAG=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest \
-           | jq -r .tag_name)
-
+RAW_TAG=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r .tag_name)
 ENC_TAG=${RAW_TAG//\//%2F}
-
 DOWNLOAD_URL="https://github.com/apernet/hysteria/releases/download/${ENC_TAG}/hysteria-linux-amd64"
 
 if wget -nv -O /usr/local/bin/hysteria-server "$DOWNLOAD_URL"; then
@@ -531,8 +523,9 @@ tls:
   cert: /etc/letsencrypt/live/$DOMAIN/fullchain.pem
   key: /etc/letsencrypt/live/$DOMAIN/privkey.pem
 auth:
-  type: password
-  password: $PASSWORD_HYSTERIA
+  type: file
+  file:
+    path: /etc/hysteria/users.db
 obfs:
   type: salamander
   salamander:
@@ -543,6 +536,8 @@ masquerade:
     url: https://1.1.1.1
     rewriteHost: true
 EOF
+
+echo "$PASSWORD_HYSTERIA" > /etc/hysteria/users.db
 
 cat > /etc/systemd/system/hysteria-server.service <<EOF
 [Unit]
@@ -588,7 +583,7 @@ echo -e "After enabling, your system will be fully configured and ready."
 echo -e "Your IP will not be whitelisted automatically. You must perform the port knock first."
 echo -e "An IP will be removed from the whitelist after 10 minutes of inactivity."
 
-echo -e "\n${YELLOW}--- Connection Info (once enabled) ---${NC}"
+echo -e "\n${YELLOW}--- Initial Connection Info (once enabled) ---${NC}"
 echo "Knock sequence for all services: $K1 -> $K2 -> $K3"
 echo "SSH Port: $SSH_PORT"
 echo
@@ -600,11 +595,11 @@ echo "  Port: $PORT_TROJAN, Password: $PASSWORD_TROJAN"
 echo
 echo -e "${YELLOW}Hysteria2 (UDP):${NC}"
 echo "  Port: $PORT_HYSTERIA"
-echo "  Auth Pass: $PASSWORD_HYSTERIA"
+echo "  Initial Auth Pass: $PASSWORD_HYSTERIA"
 echo "  OBFS Pass: $PASSWORD_HYSTERIA_OBFS"
 
 if command -v qrencode &> /dev/null; then
-  echo -e "\n${YELLOW}--- QR Codes (scan with a client app) ---${NC}"
+  echo -e "\n${YELLOW}--- QR Codes for Initial Users ---${NC}"
   echo "VLESS Configuration:"
   qrencode -t ANSIUTF8 "$VLESS_URI"
   echo "Trojan Configuration:"
