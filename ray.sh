@@ -1,6 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# --- Configuration: Paths ---
+RAY_AIO_DIR="/etc/ray-aio"
+SETTINGS_FILE="$RAY_AIO_DIR/settings.json"
+INSTALL_CONF="$RAY_AIO_DIR/install.conf"
+RAYCONTROL_PATH="/usr/local/bin/raycontrol"
+APPLY_NFTABLES_SCRIPT="/usr/local/bin/apply_nftables_xray.sh"
+XRAY_DIR="/etc/xray"
+XRAY_LOG_DIR="/var/log/xray"
+XRAY_CONFIG="$XRAY_DIR/config.json"
+XRAY_USERS_DB="$XRAY_DIR/users.db"
+XRAY_BIN="/usr/local/bin/xray"
+XRAY_SERVICE="/etc/systemd/system/xray.service"
+HYSTERIA_DIR="/etc/hysteria"
+HYSTERIA_CONFIG="$HYSTERIA_DIR/config.yaml"
+HYSTERIA_USERS_DB="$HYSTERIA_DIR/users.db"
+HYSTERIA_BIN="/usr/local/bin/hysteria-server"
+HYSTERIA_SERVICE="/etc/systemd/system/hysteria-server.service"
+SECRETS_DIR="/root/.secrets"
+CLOUDFLARE_INI="$SECRETS_DIR/cloudflare.ini"
+LE_POST_HOOK_DIR="/etc/letsencrypt/renewal-hooks/post"
+LE_POST_HOOK_SCRIPT="$LE_POST_HOOK_DIR/reload_services.sh"
+TEMP_ZIP="/tmp/Xray-linux-64.zip"
+TEMP_AWK="/tmp/check_x86_v_level.awk"
+
+# --- Configuration: Colors ---
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
@@ -19,18 +44,18 @@ cleanup() {
 
     if command -v xray &> /dev/null; then
         systemctl disable --now xray &>/dev/null
-        rm -f /usr/local/bin/xray /etc/systemd/system/xray.service
+        rm -f "$XRAY_BIN" "$XRAY_SERVICE"
     fi
     
     if command -v hysteria-server &> /dev/null; then
         systemctl disable --now hysteria-server &>/dev/null
-        rm -f /usr/local/bin/hysteria-server /etc/systemd/system/hysteria-server.service
+        rm -f "$HYSTERIA_BIN" "$HYSTERIA_SERVICE"
     fi
 
     systemctl daemon-reload
 
     echo "Removing configuration directories..."
-    rm -rf /etc/ray-aio /etc/xray /etc/hysteria /root/.secrets
+    rm -rf "$RAY_AIO_DIR" "$XRAY_DIR" "$HYSTERIA_DIR" "$SECRETS_DIR"
     
     if [[ -n "${XANMOD_PKG_NAME_INSTALLED:-}" ]]; then
         echo "Uninstalling XanMod Kernel package: ${XANMOD_PKG_NAME_INSTALLED}"
@@ -38,7 +63,7 @@ cleanup() {
     fi
 
     echo "Removing temporary files..."
-    rm -f /tmp/check_x86_v_level.awk /tmp/Xray-linux-64.zip
+    rm -f "$TEMP_AWK" "$TEMP_ZIP"
 
     echo -e "${YELLOW}Rollback complete. The system should be in its original state.${NC}"
     exit 1
@@ -151,9 +176,9 @@ apt-get install -y \
   dnsutils uuid uuid-dev uuid-runtime uuidcdef ssl-cert conntrack \
   bc coreutils watch
 
-mkdir -p /etc/ray-aio /var/backups/ray-aio
+mkdir -p "$RAY_AIO_DIR" "/var/backups/ray-aio"
 
-cat > /etc/ray-aio/install.conf <<EOF
+cat > "$INSTALL_CONF" <<EOF
 DOMAIN="$DOMAIN"
 PORT_VLESS="$PORT_VLESS"
 PORT_TROJAN="$PORT_TROJAN"
@@ -164,6 +189,15 @@ K2="$K2"
 K3="$K3"
 EOF
 
+cat > "$SETTINGS_FILE" <<EOF
+{
+  "alpn": ["h2"],
+  "vless_flow": "xtls-rprx-vision"
+}
+EOF
+VLESS_FLOW=$(jq -r '.vless_flow' "$SETTINGS_FILE")
+XRAY_ALPN=$(jq -c '.alpn' "$SETTINGS_FILE")
+
 if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
     echo -e "\n${GREEN}--- Setting up XanMod Repository ---${NC}"
     apt-get install -y gpg
@@ -172,7 +206,7 @@ if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
     echo -e "\n${GREEN}--- Updating sources for XanMod ---${NC}"
     apt-get update
     echo -e "\n${GREEN}--- Checking CPU microarchitecture level ---${NC}"
-    cat > /tmp/check_x86_v_level.awk <<'AWK'
+    cat > "$TEMP_AWK" <<'AWK'
 #!/usr/bin/awk -f
 BEGIN {
     while (!/flags/) if (getline < "/proc/cpuinfo" != 1) exit 1
@@ -184,10 +218,10 @@ BEGIN {
     exit 1
 }
 AWK
-    chmod +x /tmp/check_x86_v_level.awk
+    chmod +x "$TEMP_AWK"
     XANMOD_PKG_NAME="linux-xanmod-lts-x64v1"
     CPU_LEVEL_EXIT_CODE=0
-    /tmp/check_x86_v_level.awk || CPU_LEVEL_EXIT_CODE=$?
+    "$TEMP_AWK" || CPU_LEVEL_EXIT_CODE=$?
     case $CPU_LEVEL_EXIT_CODE in
         3) XANMOD_PKG_NAME="linux-xanmod-x64v2" ;;
         4) XANMOD_PKG_NAME="linux-xanmod-x64v3" ;;
@@ -197,7 +231,7 @@ AWK
     echo -e "\n${GREEN}--- Installing XanMod Kernel ($XANMOD_PKG_NAME) ---${NC}"
     apt-get install -y "$XANMOD_PKG_NAME"
     XANMOD_PKG_NAME_INSTALLED=$XANMOD_PKG_NAME
-    rm -f /tmp/check_x86_v_level.awk
+    rm -f "$TEMP_AWK"
 fi
 
 UUID_VLESS=$(uuidgen)
@@ -227,28 +261,34 @@ if [[ "$RESOLVED_IP" != "$SERVER_IP" ]]; then
 fi
 echo -e "${GREEN}DNS validation successful!${NC}"
 
-cat > /usr/local/bin/raycontrol <<'EOF'
+cat > "$RAYCONTROL_PATH" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-XCONF="/etc/xray/config.json"
+# --- Paths ---
+XRAY_DIR="/etc/xray"
+HYSTERIA_DIR="/etc/hysteria"
+RAY_AIO_DIR="/etc/ray-aio"
+BACKUP_DIR="/var/backups/ray-aio"
+XCONF="${XRAY_DIR}/config.json"
+HYSTERIA_CONF="${HYSTERIA_DIR}/config.yaml"
+DB_XRAY_USERS="${XRAY_DIR}/users.db"
+DB_HY_USERS="${HYSTERIA_DIR}/users.db"
+DB_IPS="${XRAY_DIR}/ips.db"
+ENABLED_FLAG="${XRAY_DIR}/enabled.flag"
+INSTALL_CONF="${RAY_AIO_DIR}/install.conf"
+SETTINGS_FILE="${RAY_AIO_DIR}/settings.json"
+
+# --- Constants ---
 NFT_TABLE="inet filter"
 NFT_SET="xray_clients"
-DB_XRAY_USERS="/etc/xray/users.db"
-DB_HY_USERS="/etc/hysteria/users.db"
-DB_IPS="/etc/xray/ips.db"
-ENABLED_FLAG="/etc/xray/enabled.flag"
-BACKUP_DIR="/var/backups/ray-aio"
-INSTALL_CONF="/etc/ray-aio/install.conf"
-HYSTERIA_CONF="/etc/hysteria/config.yaml"
-
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
 ensure_db(){
-    mkdir -p /etc/xray /etc/hysteria "$BACKUP_DIR"
+    mkdir -p "$XRAY_DIR" "$HYSTERIA_DIR" "$BACKUP_DIR"
     touch "$DB_XRAY_USERS" "$DB_HY_USERS" "$DB_IPS"
     if [ ! -f "$ENABLED_FLAG" ]; then
         echo "disabled" > "$ENABLED_FLAG"
@@ -273,10 +313,14 @@ show_qr() {
         echo -e "${RED}Error: 'qrencode' is not installed. Please run 'apt install qrencode'.${NC}" >&2
         return 1
     fi
-    if [ ! -f "$INSTALL_CONF" ]; then
-        echo -e "${RED}ERROR: Install config not found at $INSTALL_CONF${NC}" >&2; exit 1;
+    if [ ! -f "$INSTALL_CONF" ] || [ ! -f "$SETTINGS_FILE" ]; then
+        echo -e "${RED}ERROR: Core config files not found in $RAY_AIO_DIR${NC}" >&2; exit 1;
     fi
     source "$INSTALL_CONF"
+    local vless_flow
+    vless_flow=$(jq -r '.vless_flow' "$SETTINGS_FILE")
+    local alpn
+    alpn=$(jq -r '.alpn[0]' "$SETTINGS_FILE")
 
     local uri=""
     local name=""
@@ -284,11 +328,11 @@ show_qr() {
     case "$type" in
         vless)
             name="${DOMAIN}-VLESS-${id:0:8}"
-            uri="vless://${id}@${DOMAIN}:${PORT_VLESS}?type=tcp&security=xtls&flow=xtls-rprx-vision&alpn=h2&sni=${DOMAIN}#${name}"
+            uri="vless://${id}@${DOMAIN}:${PORT_VLESS}?type=tcp&security=xtls&flow=${vless_flow}&alpn=${alpn}&sni=${DOMAIN}#${name}"
             ;;
         trojan)
             name="${DOMAIN}-Trojan-${id:0:8}"
-            uri="trojan://${id}@${DOMAIN}:${PORT_TROJAN}?alpn=h2&sni=${DOMAIN}#${name}"
+            uri="trojan://${id}@${DOMAIN}:${PORT_TROJAN}?alpn=${alpn}&sni=${DOMAIN}#${name}"
             ;;
         hysteria)
             if [[ -z "$id" ]]; then
@@ -313,11 +357,13 @@ show_qr() {
 
 add_user(){
     local type="$1"
+    local vless_flow
+    vless_flow=$(jq -r '.vless_flow' "$SETTINGS_FILE")
     if [[ "$type" == "vless" ]]; then
         local uuid
         uuid=$(uuidgen)
-        jq --arg id "$uuid" \
-           '.inbounds[0].settings.clients += [{"id":$id,"flow":"xtls-rprx-vision"}]' \
+        jq --arg id "$uuid" --arg flow "$vless_flow" \
+           '.inbounds[0].settings.clients += [{"id":$id,"flow":$flow}]' \
            "$XCONF" > "$XCONF.tmp" && mv "$XCONF.tmp" "$XCONF"
         echo "vless:$uuid" >> "$DB_XRAY_USERS"
         echo -e "${GREEN}Added VLESS user: $uuid${NC}"
@@ -447,9 +493,9 @@ case "${1:-help}" in
   *)           help ;;
 esac
 EOF
-chmod +x /usr/local/bin/raycontrol
+chmod +x "$RAYCONTROL_PATH"
 
-cat > /usr/local/bin/apply_nftables_xray.sh <<EOF
+cat > "$APPLY_NFTABLES_SCRIPT" <<EOF
 #!/usr/bin/env bash
 set -e
 SSH_PORT="$SSH_PORT"
@@ -482,63 +528,64 @@ nft add rule inet filter input tcp dport $K3 ip saddr @knock_stage2 jump knock
 nft add rule inet filter knock add @xray_clients '{ ip saddr }'
 nft add rule inet filter knock drop
 EOF
-chmod +x /usr/local/bin/apply_nftables_xray.sh
+chmod +x "$APPLY_NFTABLES_SCRIPT"
 
 echo -e "\n${GREEN}--- Issuing Certificate with Certbot ---${NC}"
-mkdir -p /root/.secrets
-cat > /root/.secrets/cloudflare.ini <<EOF
+mkdir -p "$SECRETS_DIR"
+cat > "$CLOUDFLARE_INI" <<EOF
 dns_cloudflare_api_token = $CF_API_TOKEN
 EOF
-chmod 600 /root/.secrets/cloudflare.ini
+chmod 600 "$CLOUDFLARE_INI"
 certbot certonly \
   --dns-cloudflare \
-  --dns-cloudflare-credentials /root/.secrets/cloudflare.ini \
+  --dns-cloudflare-credentials "$CLOUDFLARE_INI" \
   --agree-tos --no-eff-email \
   -m "$EMAIL" \
   -d "$DOMAIN"
 
 echo -e "\n${GREEN}--- Configuring Automatic Certificate Renewal ---${NC}"
-mkdir -p /etc/letsencrypt/renewal-hooks/post
-cat > /etc/letsencrypt/renewal-hooks/post/reload_services.sh <<'EOF'
+mkdir -p "$LE_POST_HOOK_DIR"
+cat > "$LE_POST_HOOK_SCRIPT" <<'EOF'
 #!/usr/bin/env bash
-if [[ -f /etc/xray/enabled.flag && "$(cat /etc/xray/enabled.flag)" == "enabled" ]]; then
+ENABLED_FLAG="/etc/xray/enabled.flag"
+if [[ -f "$ENABLED_FLAG" && "$(cat "$ENABLED_FLAG")" == "enabled" ]]; then
     systemctl restart xray
     systemctl restart hysteria-server
 fi
 EOF
-chmod +x /etc/letsencrypt/renewal-hooks/post/reload_services.sh
+chmod +x "$LE_POST_HOOK_SCRIPT"
 
 echo -e "\n${GREEN}--- Installing Xray-core ---${NC}"
-mkdir -p /etc/xray /var/log/xray
-chown -R nobody:nogroup /etc/xray /var/log/xray
+mkdir -p "$XRAY_DIR" "$XRAY_LOG_DIR"
+chown -R nobody:nogroup "$XRAY_DIR" "$XRAY_LOG_DIR"
 XRAY_VER=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
-wget -qO /tmp/Xray-linux-64.zip "https://github.com/XTLS/Xray-core/releases/download/$XRAY_VER/Xray-linux-64.zip"
-unzip -qo /tmp/Xray-linux-64.zip -d /usr/local/bin
-rm /tmp/Xray-linux-64.zip
-chmod +x /usr/local/bin/xray
+wget -qO "$TEMP_ZIP" "https://github.com/XTLS/Xray-core/releases/download/$XRAY_VER/Xray-linux-64.zip"
+unzip -qo "$TEMP_ZIP" -d /usr/local/bin
+rm "$TEMP_ZIP"
+chmod +x "$XRAY_BIN"
 
-cat > /etc/xray/config.json <<EOF
+cat > "$XRAY_CONFIG" <<EOF
 {
   "log": {"loglevel": "warning"},
   "inbounds": [
     {
       "port": $PORT_VLESS, "protocol": "vless",
-      "settings": {"clients": [{"id": "$UUID_VLESS", "flow": "xtls-rprx-vision"}], "decryption": "none"},
-      "streamSettings": {"network": "tcp", "security": "tls", "xtlsSettings": {"certificates": [{"certificateFile": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem", "keyFile": "/etc/letsencrypt/live/$DOMAIN/privkey.pem"}], "alpn": ["h2"]}}
+      "settings": {"clients": [{"id": "$UUID_VLESS", "flow": "$VLESS_FLOW"}], "decryption": "none"},
+      "streamSettings": {"network": "tcp", "security": "tls", "xtlsSettings": {"certificates": [{"certificateFile": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem", "keyFile": "/etc/letsencrypt/live/$DOMAIN/privkey.pem"}], "alpn": $XRAY_ALPN}}
     },
     {
       "port": $PORT_TROJAN, "protocol": "trojan",
       "settings": {"clients": [{"password": "$PASSWORD_TROJAN"}], "fallbacks": [{"dest": "@blackhole"}]},
-      "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": {"certificates": [{"certificateFile": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem", "keyFile": "/etc/letsencrypt/live/$DOMAIN/privkey.pem"}], "alpn": ["h2"]}}
+      "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": {"certificates": [{"certificateFile": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem", "keyFile": "/etc/letsencrypt/live/$DOMAIN/privkey.pem"}], "alpn": $XRAY_ALPN}}
     }
   ],
   "outbounds": [{"protocol": "freedom"}, {"protocol": "blackhole", "tag": "@blackhole"}]
 }
 EOF
-echo "vless:$UUID_VLESS" > /etc/xray/users.db
-echo "trojan:$PASSWORD_TROJAN" >> /etc/xray/users.db
+echo "vless:$UUID_VLESS" > "$XRAY_USERS_DB"
+echo "trojan:$PASSWORD_TROJAN" >> "$XRAY_USERS_DB"
 
-cat > /etc/systemd/system/xray.service <<EOF
+cat > "$XRAY_SERVICE" <<EOF
 [Unit]
 Description=Xray Service
 After=network.target nss-lookup.target
@@ -547,7 +594,7 @@ User=nobody
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
-ExecStart=/usr/local/bin/xray -config /etc/xray/config.json
+ExecStart=$XRAY_BIN -config $XRAY_CONFIG
 Restart=on-failure
 [Install]
 WantedBy=multi-user.target
@@ -557,12 +604,12 @@ echo -e "\n${GREEN}--- Installing Hysteria2 ---${NC}"
 RAW_TAG=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r .tag_name)
 ENC_TAG=${RAW_TAG//\//%2F}
 DOWNLOAD_URL="https://github.com/apernet/hysteria/releases/download/${ENC_TAG}/hysteria-linux-amd64"
-wget -nv -O /usr/local/bin/hysteria-server "$DOWNLOAD_URL"
-chmod +x /usr/local/bin/hysteria-server
+wget -nv -O "$HYSTERIA_BIN" "$DOWNLOAD_URL"
+chmod +x "$HYSTERIA_BIN"
 echo -e "${GREEN}Hysteria2 installed successfully!${NC}"
 
-mkdir -p /etc/hysteria
-cat > /etc/hysteria/config.yaml <<EOF
+mkdir -p "$HYSTERIA_DIR"
+cat > "$HYSTERIA_CONFIG" <<EOF
 listen: :$PORT_HYSTERIA
 tls:
   cert: /etc/letsencrypt/live/$DOMAIN/fullchain.pem
@@ -570,7 +617,7 @@ tls:
 auth:
   type: file
   file:
-    path: /etc/hysteria/users.db
+    path: $HYSTERIA_USERS_DB
 obfs:
   type: salamander
   salamander:
@@ -582,9 +629,9 @@ masquerade:
     rewriteHost: true
 EOF
 
-echo "$PASSWORD_HYSTERIA" > /etc/hysteria/users.db
+echo "$PASSWORD_HYSTERIA" > "$HYSTERIA_USERS_DB"
 
-cat > /etc/systemd/system/hysteria-server.service <<EOF
+cat > "$HYSTERIA_SERVICE" <<EOF
 [Unit]
 Description=Hysteria2 Service
 After=network.target nss-lookup.target
@@ -593,7 +640,7 @@ User=nobody
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
-ExecStart=/usr/local/bin/hysteria-server server -c /etc/hysteria/config.yaml
+ExecStart=$HYSTERIA_BIN server -c $HYSTERIA_CONFIG
 Restart=on-failure
 [Install]
 WantedBy=multi-user.target
@@ -607,8 +654,8 @@ systemctl daemon-reload
 systemctl enable xray
 systemctl enable hysteria-server
 
-VLESS_URI="vless://${UUID_VLESS}@${DOMAIN}:${PORT_VLESS}?type=tcp&security=xtls&flow=xtls-rprx-vision&alpn=h2&sni=${DOMAIN}#${DOMAIN}-VLESS"
-TROJAN_URI="trojan://${PASSWORD_TROJAN}@${DOMAIN}:${PORT_TROJAN}?alpn=h2&sni=${DOMAIN}#${DOMAIN}-Trojan"
+VLESS_URI="vless://${UUID_VLESS}@${DOMAIN}:${PORT_VLESS}?type=tcp&security=xtls&flow=${VLESS_FLOW}&alpn=$(jq -r '.alpn[0]' "$SETTINGS_FILE")&sni=${DOMAIN}#${DOMAIN}-VLESS"
+TROJAN_URI="trojan://${PASSWORD_TROJAN}@${DOMAIN}:${PORT_TROJAN}?alpn=$(jq -r '.alpn[0]' "$SETTINGS_FILE")&sni=${DOMAIN}#${DOMAIN}-Trojan"
 HYSTERIA_URI="hysteria2://${PASSWORD_HYSTERIA}@${DOMAIN}:${PORT_HYSTERIA}?sni=${DOMAIN}&obfs=salamander&obfs-password=${PASSWORD_HYSTERIA_OBFS}#${DOMAIN}-Hysteria2"
 
 trap - ERR EXIT
@@ -620,11 +667,11 @@ echo -e "${YELLOW}=====================================================${NC}\n"
 
 if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
     echo -e "${YELLOW}IMPORTANT: A reboot is required to use the new XanMod kernel.${NC}"
-    echo -e "After rebooting, run 'raycontrol enable'.\n"
+    echo -e "After rebooting, run '$RAYCONTROL_PATH enable'.\n"
 else
     echo -e "Services are installed but NOT RUNNING. The firewall is NOT ACTIVE."
     echo -e "To start all services and apply the firewall, run:\n"
-    echo -e "  ${GREEN}raycontrol enable${NC}\n"
+    echo -e "  ${GREEN}$RAYCONTROL_PATH enable${NC}\n"
 fi
 echo -e "After enabling, your system will be fully configured and ready."
 echo -e "Your IP will not be whitelisted automatically. You must perform the port knock first."
@@ -634,10 +681,10 @@ echo -e "\n${YELLOW}--- Initial Connection Info (once enabled) ---${NC}"
 echo "Knock sequence for all services: $K1 -> $K2 -> $K3"
 echo "SSH Port: $SSH_PORT"
 echo
-echo -e "${YELLOW}VLESS (TCP, H2-Only):${NC}"
+echo -e "${YELLOW}VLESS (TCP, $(jq -r '.alpn[0]' "$SETTINGS_FILE")-Only):${NC}"
 echo "  Port: $PORT_VLESS, UUID: $UUID_VLESS"
 echo
-echo -e "${YELLOW}Trojan (TCP, H2-Only):${NC}"
+echo -e "${YELLOW}Trojan (TCP, $(jq -r '.alpn[0]' "$SETTINGS_FILE")-Only):${NC}"
 echo "  Port: $PORT_TROJAN, Password: $PASSWORD_TROJAN"
 echo
 echo -e "${YELLOW}Hysteria2 (UDP):${NC}"
@@ -660,5 +707,5 @@ else
   echo "Hysteria2: $HYSTERIA_URI"
 fi
 
-echo -e "\nUse ${GREEN}'raycontrol help'${NC} for a full list of commands including status, backup, and restore."
+echo -e "\nUse ${GREEN}'$RAYCONTROL_PATH help'${NC} for a full list of commands including status, backup, and restore."
 echo -e "\n${GREEN}=========================================================================================${NC}\n"
