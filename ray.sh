@@ -84,7 +84,7 @@ apt install -y \
   python3-certbot-dns-cloudflare \
   uuid-runtime openssl socat gawk \
   dnsutils uuid uuid-dev uuid-runtime uuidcdef ssl-cert conntrack \
-  bc numfmt watch
+  bc coreutils watch
 
 # Create directories for config and backups
 mkdir -p /etc/ray-aio /var/backups/ray-aio
