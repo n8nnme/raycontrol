@@ -256,6 +256,7 @@ AWK
     XANMOD_PKG_NAME="linux-xanmod-lts-x64v1"
     CPU_LEVEL_EXIT_CODE=0
     "$TEMP_AWK" || CPU_LEVEL_EXIT_CODE=$?
+    rm -f "$TEMP_AWK"
     case $CPU_LEVEL_EXIT_CODE in
         3) XANMOD_PKG_NAME="linux-xanmod-x64v2" ;;
         4) XANMOD_PKG_NAME="linux-xanmod-x64v3" ;;
@@ -265,7 +266,6 @@ AWK
     log_info "--- Installing XanMod Kernel ($XANMOD_PKG_NAME) ---"
     apt-get install -y "$XANMOD_PKG_NAME"
     XANMOD_PKG_NAME_INSTALLED=$XANMOD_PKG_NAME
-    rm -f "$TEMP_AWK"
 fi
 
 UUID_VLESS=$(uuidgen)
@@ -351,6 +351,8 @@ NFT_SET="xray_clients"
 ensure_db(){
     mkdir -p "$XRAY_DIR" "$HYSTERIA_DIR" "$BACKUP_DIR"
     touch "$DB_XRAY_USERS" "$DB_HY_USERS" "$DB_IPS"
+    chmod 600 "$DB_XRAY_USERS" "$DB_HY_USERS" "$DB_IPS"
+    chown nobody:nogroup "$DB_XRAY_USERS" "$DB_HY_USERS" "$DB_IPS"
     if [ ! -f "$ENABLED_FLAG" ]; then
         echo "disabled" > "$ENABLED_FLAG"
     fi
@@ -717,6 +719,9 @@ WantedBy=multi-user.target
 EOF
 
 usermod -aG ssl-cert nobody
+touch "$XRAY_DIR/ips.db"
+chmod 600 "$XRAY_USERS_DB" "$HYSTERIA_USERS_DB" "$XRAY_DIR/ips.db"
+chown nobody:nogroup "$XRAY_USERS_DB" "$HYSTERIA_USERS_DB" "$XRAY_DIR/ips.db"
 chgrp -R ssl-cert /etc/letsencrypt/live /etc/letsencrypt/archive
 chmod -R g+rx /etc/letsencrypt/live /etc/letsencrypt/archive
 
