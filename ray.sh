@@ -716,5 +716,5 @@ else
   echo "Hysteria2: $HYSTERIA_URI"
 fi
 
-echo -e "\nUse ${GREEN}'raycontrol help'${NC} for a full list of new commands including status, backup, and restore."
+echo -e "\nUse ${GREEN}'raycontrol help'${NC} for a full list of commands including status, backup, and restore."
 echo -e "\n${GREEN}=========================================================================================${NC}\n"
