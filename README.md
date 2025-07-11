@@ -4,3 +4,8 @@ Just a simple xray (naive look like inbound + trojan) and hysteria2 solution wit
 ```
 bash <(curl -Ls https://raw.githubusercontent.com/n8nnme/raycontrol/refs/heads/main/ray.sh)
 ```
+
+# uninstall:
+```
+bash <(curl -Ls https://raw.githubusercontent.com/n8nnme/raycontrol/refs/heads/main/uninstall.sh)
+```
