@@ -233,9 +233,7 @@ add_user(){
 del_user(){
     local id="$1"
     if grep -qE "^(vless|trojan):$id" "$DB_USERS"; then
-        # remove from DB
         sed -i "\%^.*:$id.*\$%d" "$DB_USERS"
-        # remove from config.json
         jq "walk(
             if . == \"$id\" then empty
             else . end
@@ -318,9 +316,39 @@ del_ip(){
     fi
 }
 
+apply_nftables(){
+    nft flush ruleset
+    nft add table inet filter
+    nft add chain inet filter input  '{ type filter hook input priority 0; policy drop; }'
+    nft add chain inet filter forward '{ type filter hook forward priority 0; policy drop; }'
+    nft add chain inet filter output '{ type filter hook output priority 0; policy accept; }'
+
+    nft add rule inet filter input iif lo accept
+    nft add rule inet filter input ct state established,related accept
+    nft add rule inet filter input ip protocol icmp accept
+    nft add rule inet filter input ip6 nexthdr ipv6-icmp accept
+
+    nft add set inet filter knock_stage1 '{ type ipv4_addr; flags dynamic; timeout 10s; }'
+    nft add set inet filter knock_stage2 '{ type ipv4_addr; flags dynamic; timeout 10s; }'
+    nft add set inet filter xray_clients '{ type ipv4_addr; flags dynamic; timeout 10m; }'
+    nft add chain inet filter knock
+
+    nft add rule inet filter input tcp dport $K1 add @knock_stage1 '{ ip saddr }' drop
+    nft add rule inet filter input tcp dport $K2 ip saddr @knock_stage1 add @knock_stage2 '{ ip saddr }' drop
+    nft add rule inet filter input tcp dport $K3 ip saddr @knock_stage2 jump knock
+
+    nft add rule inet filter knock add @xray_clients '{ ip saddr }'
+    nft add rule inet filter knock drop
+
+    nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_VLESS counter update @xray_clients '{ ip saddr }' accept comment "vless_bw"
+    nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_TROJAN counter update @xray_clients '{ ip saddr }' accept comment "trojan_bw"
+    nft add rule inet filter input ip saddr @xray_clients udp dport $PORT_HYSTERIA counter update @xray_clients '{ ip saddr }' accept comment "hysteria_bw"
+    nft add rule inet filter input ip saddr @xray_clients tcp dport $SSH_PORT counter update @xray_clients '{ ip saddr }' accept comment "ssh_bw"
+}
+
 enable_all(){
     echo "enabled" > "$ENABLED_FLAG"
-    bash /usr/local/bin/apply_nftables_xray.sh
+    apply_nftables
     systemctl enable nftables
     systemctl start nftables
     systemctl start xray
@@ -339,7 +367,7 @@ disable_all(){
     echo "All services and firewall disabled. Flushed rules have been persisted."
 }
 
-backup_config() {
+backup_config(){
     local backup_file="$BACKUP_DIR/ray-aio-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
     echo "Starting backup..."
     tar -czf "$backup_file" \
@@ -352,43 +380,33 @@ backup_config() {
         /etc/nftables.conf \
         /etc/systemd/system/xray.service \
         /etc/systemd/system/hysteria-server.service
-
     echo -e "${GREEN}Backup complete! File saved to: $backup_file${NC}"
 }
 
-restore_config() {
+restore_config(){
     local backup_file="$1"
     if [[ ! -f "$backup_file" ]]; then
         echo -e "${RED}ERROR: Backup file not found: $backup_file${NC}" >&2
         exit 1
     fi
-
     echo -e "${YELLOW}WARNING: This will overwrite all current configurations and data.${NC}"
     read -rp "Are you sure you want to restore from $backup_file? [y/N]: " confirm
     if [[ "${confirm,,}" != "y" ]]; then
         echo "Restore cancelled."
         exit 0
     fi
-
-    echo "Disabling services before restore..."
     disable_all
-
     echo "Restoring files..."
     tar -xzf "$backup_file" -C /
-
-    echo "Reloading systemd..."
     systemctl daemon-reload
-
     echo -e "${GREEN}Restore complete!${NC}"
-    echo "Please review restored configurations."
     echo "Run 'raycontrol enable' to restart services with the restored configuration."
 }
 
-show_status() {
+show_status(){
     source "$INSTALL_CONF"
 
-    # Helper for status text
-    get_status_text() {
+    get_status_text(){
         if systemctl is-active --quiet "$1"; then
             echo -e "${GREEN}active${NC}"
         else
@@ -396,13 +414,12 @@ show_status() {
         fi
     }
 
-    # Helper to get bandwidth
-    get_bw() {
-        local counter_name=$1
+    get_bw(){
+        local counter="$1"
         local bytes
-        bytes=$(nft -j list ruleset | jq -r ".nftables[] | select(.rule) | .rule | select(.comment == \"$counter_name\") | .bytes")
+        bytes=$(nft -j list ruleset | jq -r ".nftables[] | select(.rule) | .rule | select(.comment == \"$counter\") | .bytes")
         if [[ -n "$bytes" && "$bytes" -gt 0 ]]; then
-            echo "$(numfmt --to=iec-i --suffix=B --format="%.2f" "$bytes")"
+            numfmt --to=iec-i --suffix=B --format="%.2f" "$bytes"
         else
             echo "0.00B"
         fi
@@ -422,26 +439,27 @@ show_status() {
 
     echo -e "\n${YELLOW}--- Monitoring ---${NC}"
     if systemctl is-active --quiet nftables; then
-      local vless_conns trojan_conns hysteria_conns
-      vless_conns=$(conntrack -L -p tcp --dport "$PORT_VLESS" 2>/dev/null | grep -c ESTABLISHED || echo 0)
-      trojan_conns=$(conntrack -L -p tcp --dport "$PORT_TROJAN" 2>/dev/null | grep -c ESTABLISHED || echo 0)
-      hysteria_conns=$(conntrack -L -p udp --dport "$PORT_HYSTERIA" 2>/dev/null | grep -c ASSURED || echo 0)
+        local vless_conns trojan_conns hysteria_conns
+        vless_conns=$(conntrack -L -p tcp --dport "$PORT_VLESS" 2>/dev/null | grep -c ESTABLISHED || echo 0)
+        trojan_conns=$(conntrack -L -p tcp --dport "$PORT_TROJAN" 2>/dev/null | grep -c ESTABLISHED || echo 0)
+        hysteria_conns=$(conntrack -L -p udp --dport "$PORT_HYSTERIA" 2>/dev/null | grep -c ASSURED || echo 0)
 
-      printf "%-18s: %d\n" "VLESS Connections" "$vless_conns"
-      printf "%-18s: %d\n" "Trojan Connections" "$trojan_conns"
-      printf "%-18s: %d\n" "Hysteria Conns" "$hysteria_conns"
-      echo
-      printf "%-18s: %s\n" "VLESS Bandwidth" "$(get_bw vless_bw)"
-      printf "%-18s: %s\n" "Trojan Bandwidth" "$(get_bw trojan_bw)"
-      printf "%-18s: %s\n" "Hysteria Bandwidth" "$(get_bw hysteria_bw)"
+        printf "%-18s: %s\n" "VLESS Connections" "$vless_conns"
+        printf "%-18s: %s\n" "Trojan Connections" "$trojan_conns"
+        printf "%-18s: %s\n" "Hysteria Conns" "$hysteria_conns"
+
+        printf "%-18s: %s\n" "VLESS Bandwidth" "$(get_bw vless_bw)"
+        printf "%-18s: %s\n" "Trojan Bandwidth" "$(get_bw trojan_bw)"
+        printf "%-18s: %s\n" "Hysteria Bandwidth" "$(get_bw hysteria_bw)"
     else
-      echo "Firewall is inactive, cannot report monitoring stats."
+        echo "Firewall is inactive, cannot report monitoring stats."
     fi
 }
 
 help(){
     cat <<MSG
 Usage: raycontrol <command> [args]
+
 Services Management:
   enable         Enable all services + firewall and persist rules
   disable        Disable all services + firewall and persist flushed rules
@@ -465,8 +483,8 @@ IP Whitelist Management:
 MSG
 }
 
+# Main entry
 ensure_db
-
 case "${1:-help}" in
   help)        help ;;
   enable)      enable_all ;;
@@ -505,33 +523,35 @@ TCP_PORTS_PROTECTED="$SSH_PORT,$PORT_VLESS,$PORT_TROJAN"
 nft flush ruleset
 
 nft add table inet filter
-nft add chain inet filter input { type filter hook input priority 0; policy drop; }
-nft add chain inet filter forward { type filter hook forward priority 0; policy drop; }
-nft add chain inet filter output { type filter hook output priority 0; policy accept; }
+
+nft add chain inet filter input  '{ type filter hook input priority 0; policy drop; }'
+nft add chain inet filter forward '{ type filter hook forward priority 0; policy drop; }'
+nft add chain inet filter output '{ type filter hook output priority 0; policy accept; }'
 
 nft add rule inet filter input iif lo accept
 nft add rule inet filter input ct state established,related accept
 nft add rule inet filter input ip protocol icmp accept
 nft add rule inet filter input ip6 nexthdr ipv6-icmp accept
 
-nft add set inet filter knock_stage1 { type ipv4_addr; flags dynamic; timeout 10s; }
-nft add set inet filter knock_stage2 { type ipv4_addr; flags dynamic; timeout 10s; }
-nft add set inet filter xray_clients { type ipv4_addr; flags dynamic; timeout 10m; }
+nft add set inet filter knock_stage1 '{ type ipv4_addr; flags dynamic; timeout 10s; }'
+nft add set inet filter knock_stage2 '{ type ipv4_addr; flags dynamic; timeout 10s; }'
+nft add set inet filter xray_clients '{ type ipv4_addr; flags dynamic; timeout 10m; }'
+
+# Define the custom “knock” chain (no hook needed)
 nft add chain inet filter knock
 
-nft add rule inet filter input tcp dport $K1 add @knock_stage1 { ip saddr } drop
-nft add rule inet filter input tcp dport $K2 ip saddr @knock_stage1 add @knock_stage2 { ip saddr } drop
+nft add rule inet filter input tcp dport $K1 add @knock_stage1 '{ ip saddr }' drop
+nft add rule inet filter input tcp dport $K2 ip saddr @knock_stage1 add @knock_stage2 '{ ip saddr }' drop
 nft add rule inet filter input tcp dport $K3 ip saddr @knock_stage2 jump knock
 
-nft add rule inet filter knock add @xray_clients { ip saddr }
+nft add rule inet filter knock add @xray_clients '{ ip saddr }'
 nft add rule inet filter knock drop
 
 # Add rules with named counters for bandwidth monitoring
-nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_VLESS counter update @xray_clients { ip saddr } accept comment "vless_bw"
-nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_TROJAN counter update @xray_clients { ip saddr } accept comment "trojan_bw"
-nft add rule inet filter input ip saddr @xray_clients udp dport $PORT_HYSTERIA counter update @xray_clients { ip saddr } accept comment "hysteria_bw"
-nft add rule inet filter input ip saddr @xray_clients tcp dport $SSH_PORT counter update @xray_clients { ip saddr } accept comment "ssh_bw"
-
+nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_VLESS counter update @xray_clients '{ ip saddr }' accept comment "vless_bw"
+nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_TROJAN counter update @xray_clients '{ ip saddr }' accept comment "trojan_bw"
+nft add rule inet filter input ip saddr @xray_clients udp dport $PORT_HYSTERIA counter update @xray_clients '{ ip saddr }' accept comment "hysteria_bw"
+nft add rule inet filter input ip saddr @xray_clients tcp dport $SSH_PORT counter update @xray_clients '{ ip saddr }' accept comment "ssh_bw"
 EOF
 chmod +x /usr/local/bin/apply_nftables_xray.sh
 
