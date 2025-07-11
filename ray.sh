@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# --- Argument Parsing ---
+DEBUG=false
+VERBOSE_FLAG=""
+if [[ "${1:-}" == "--debug" || "${1:-}" == "--verbose" ]]; then
+    DEBUG=true
+    VERBOSE_FLAG=$1
+    set -x # Enable expanded output for troubleshooting
+fi
+
 # --- Configuration: Paths ---
 RAY_AIO_DIR="/etc/ray-aio"
 SETTINGS_FILE="$RAY_AIO_DIR/settings.json"
 INSTALL_CONF="$RAY_AIO_DIR/install.conf"
+LOG_FILE="/var/log/raycontrol.log"
 RAYCONTROL_PATH="/usr/local/bin/raycontrol"
 APPLY_NFTABLES_SCRIPT="/usr/local/bin/apply_nftables_xray.sh"
 XRAY_DIR="/etc/xray"
@@ -31,14 +41,37 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
+# --- Logging Functions ---
+log_msg() {
+    local level_color="$1"
+    local level_text="$2"
+    local message="$3"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level_text] $message" | tee -a "$LOG_FILE" > /dev/null
+    echo -e "${level_color}[$timestamp] [$level_text] ${message}${NC}"
+}
+log_info() {
+    log_msg "$GREEN" "INFO" "$1"
+}
+log_warn() {
+    log_msg "$YELLOW" "WARN" "$1"
+}
+log_error() {
+    log_msg "$RED" "ERROR" "$1" >&2
+}
+
+touch "$LOG_FILE"
+chmod 644 "$LOG_FILE"
+
 trap 'cleanup' ERR EXIT
 
 cleanup() {
     set +e
-    echo -e "\n${RED}--- An error occurred. Rolling back changes... ---${NC}"
-    
+    log_error "--- An error occurred. Rolling back changes... ---"
+
     if systemctl is-active --quiet nftables; then
-        echo "Flushing firewall rules..."
+        log_warn "Flushing firewall rules..."
         nft flush ruleset
     fi
 
@@ -46,7 +79,7 @@ cleanup() {
         systemctl disable --now xray &>/dev/null
         rm -f "$XRAY_BIN" "$XRAY_SERVICE"
     fi
-    
+
     if command -v hysteria-server &> /dev/null; then
         systemctl disable --now hysteria-server &>/dev/null
         rm -f "$HYSTERIA_BIN" "$HYSTERIA_SERVICE"
@@ -54,18 +87,18 @@ cleanup() {
 
     systemctl daemon-reload
 
-    echo "Removing configuration directories..."
+    log_warn "Removing configuration directories..."
     rm -rf "$RAY_AIO_DIR" "$XRAY_DIR" "$HYSTERIA_DIR" "$SECRETS_DIR"
-    
+
     if [[ -n "${XANMOD_PKG_NAME_INSTALLED:-}" ]]; then
-        echo "Uninstalling XanMod Kernel package: ${XANMOD_PKG_NAME_INSTALLED}"
+        log_warn "Uninstalling XanMod Kernel package: ${XANMOD_PKG_NAME_INSTALLED}"
         apt-get remove -y "$XANMOD_PKG_NAME_INSTALLED"
     fi
 
-    echo "Removing temporary files..."
+    log_warn "Removing temporary files..."
     rm -f "$TEMP_AWK" "$TEMP_ZIP"
 
-    echo -e "${YELLOW}Rollback complete. The system should be in its original state.${NC}"
+    log_warn "Rollback complete. The system should be in its original state."
     exit 1
 }
 
@@ -74,17 +107,17 @@ validate_port() {
     local port_name="$2"
     local min_val="${3:-1}"
     if ! [[ "$port_val" =~ ^[1-9][0-9]*$ ]]; then
-        echo -e "${RED}ERROR: Port '$port_name' ($port_val) is not a valid number.${NC}" >&2
+        log_error "Port '$port_name' ($port_val) is not a valid number."
         exit 1
     fi
     if (( port_val < min_val || port_val > 65535 )); then
-        echo -e "${RED}ERROR: Port '$port_name' ($port_val) must be between $min_val and 65535.${NC}" >&2
+        log_error "Port '$port_name' ($port_val) must be between $min_val and 65535."
         exit 1
     fi
 }
 
 if [[ $EUID -ne 0 ]]; then
-  echo -e "${RED}ERROR: This script must be run as root.${NC}" >&2
+  log_error "This script must be run as root."
   exit 1
 fi
 
@@ -92,21 +125,21 @@ read -rp "Domain (e.g. your.domain.com): " DOMAIN
 read -rp "Cloudflare API Token: " CF_API_TOKEN
 read -rp "Let’s Encrypt email: " EMAIL
 
-echo -e "\n${GREEN}--- Verifying Cloudflare API Token ---${NC}"
+log_info "--- Verifying Cloudflare API Token ---"
 CF_ZONE_ID_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN" \
   -H "Authorization: Bearer $CF_API_TOKEN" \
   -H "Content-Type: application/json")
 
 if ! echo "$CF_ZONE_ID_RESPONSE" | jq -e '.success' &>/dev/null; then
     ERROR_MSG=$(echo "$CF_ZONE_ID_RESPONSE" | jq -r '.errors[0].message' 2>/dev/null || echo "Unknown error")
-    echo -e "${RED}ERROR: Cloudflare API token is invalid or lacks 'Zone.Read' permissions.${NC}" >&2
-    echo -e "${RED}API response: $ERROR_MSG${NC}" >&2
+    log_error "Cloudflare API token is invalid or lacks 'Zone.Read' permissions."
+    log_error "API response: $ERROR_MSG"
     exit 1
 fi
-echo -e "${GREEN}Cloudflare API Token appears to be valid.${NC}"
+log_info "Cloudflare API Token appears to be valid."
 
 echo
-echo -e "${YELLOW}Specify three distinct TCP ports for Port Knocking (e.g. 10001 10002 10003):${NC}"
+log_warn "Specify three distinct TCP ports for Port Knocking (e.g. 10001 10002 10003):"
 read -rp "Knock ports: " K1 K2 K3
 
 read -rp "Port for VLESS/XTLS (TCP, 200–65535, default 443): " PORT_VLESS
@@ -120,7 +153,7 @@ validate_port "$K1" "K1"
 validate_port "$K2" "K2"
 validate_port "$K3" "K3"
 if [[ "$K1" == "$K2" || "$K2" == "$K3" || "$K1" == "$K3" ]]; then
-  echo -e "${RED}ERROR: Knock ports must be three distinct numbers.${NC}" >&2
+  log_error "Knock ports must be three distinct numbers."
   exit 1
 fi
 
@@ -131,25 +164,26 @@ validate_port "$PORT_HYSTERIA" "PORT_HYSTERIA" 200
 echo
 read -rp "Install XanMod kernel for BBRv3 and other optimizations? [y/N]: " INSTALL_XANMOD
 
-echo -e "\n${GREEN}--- Pre-flight Checks ---${NC}"
+log_info "--- Pre-flight Checks ---"
 SSH_PORT=$(ss -tnlp | awk '/sshd/ && /LISTEN/ { sub(".*:", "", $4); print $4; exit }')
-echo "Detected SSH port: $SSH_PORT"
+log_info "Detected SSH port: $SSH_PORT"
 
 for P_VAR in PORT_VLESS PORT_TROJAN; do
     VAL=${!P_VAR}
     if ss -tlpn | grep -q ":$VAL\s"; then
-        echo -e "${RED}ERROR: TCP Port $VAL is already in use.${NC}" >&2
+        log_error "TCP Port $VAL is already in use."
         exit 1
     fi
-    echo -e "TCP Port $VAL is available."
+    log_info "TCP Port $VAL is available."
 done
 if ss -ulpn | grep -q ":$PORT_HYSTERIA\s"; then
-    echo -e "${RED}ERROR: UDP Port $PORT_HYSTERIA is already in use.${NC}" >&2
+    log_error "UDP Port $PORT_HYSTERIA is already in use."
     exit 1
 fi
-echo -e "UDP Port $PORT_HYSTERIA is available."
+log_info "UDP Port $PORT_HYSTERIA is available."
 
-echo -e "\n${YELLOW}--- Installation Summary ---${NC}"
+echo
+log_warn "--- Installation Summary ---"
 echo "Domain:             $DOMAIN"
 echo "VLESS Port (TCP):   $PORT_VLESS"
 echo "Trojan Port (TCP):  $PORT_TROJAN"
@@ -167,7 +201,7 @@ if [[ "${CONFIRM,,}" != "y" ]]; then
     exit 1
 fi
 
-echo -e "\n${GREEN}--- Installing Core Dependencies ---${NC}"
+log_info "--- Installing Core Dependencies ---"
 apt-get update
 apt-get install -y \
   curl wget unzip jq nftables certbot qrencode \
@@ -199,13 +233,13 @@ VLESS_FLOW=$(jq -r '.vless_flow' "$SETTINGS_FILE")
 XRAY_ALPN=$(jq -c '.alpn' "$SETTINGS_FILE")
 
 if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
-    echo -e "\n${GREEN}--- Setting up XanMod Repository ---${NC}"
+    log_info "--- Setting up XanMod Repository ---"
     apt-get install -y gpg
     echo 'deb http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-kernel.list
     wget -qO - https://dl.xanmod.org/gpg.key | gpg --dearmor -o /etc/apt/trusted.gpg.d/xanmod-kernel.gpg
-    echo -e "\n${GREEN}--- Updating sources for XanMod ---${NC}"
+    log_info "--- Updating sources for XanMod ---"
     apt-get update
-    echo -e "\n${GREEN}--- Checking CPU microarchitecture level ---${NC}"
+    log_info "--- Checking CPU microarchitecture level ---"
     cat > "$TEMP_AWK" <<'AWK'
 #!/usr/bin/awk -f
 BEGIN {
@@ -228,7 +262,7 @@ AWK
         5) XANMOD_PKG_NAME="linux-xanmod-x64v3" ;;
         *) XANMOD_PKG_NAME="linux-xanmod-lts-x64v1" ;;
     esac
-    echo -e "\n${GREEN}--- Installing XanMod Kernel ($XANMOD_PKG_NAME) ---${NC}"
+    log_info "--- Installing XanMod Kernel ($XANMOD_PKG_NAME) ---"
     apt-get install -y "$XANMOD_PKG_NAME"
     XANMOD_PKG_NAME_INSTALLED=$XANMOD_PKG_NAME
     rm -f "$TEMP_AWK"
@@ -239,33 +273,66 @@ PASSWORD_TROJAN=$(head -c16 /dev/urandom | base64 | tr '+/' '_-' | cut -c1-16)
 PASSWORD_HYSTERIA=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
 PASSWORD_HYSTERIA_OBFS=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
 
-echo -e "\n${GREEN}--- Validating DNS Records ---${NC}"
+log_info "--- Validating DNS Records ---"
 SERVER_IP=$(curl -s https://ipwho.de/ip)
 if [[ -z "$SERVER_IP" ]]; then
-    echo -e "${RED}ERROR: Could not determine server's public IP address.${NC}" >&2
+    log_error "Could not determine server's public IP address."
     exit 1
 fi
-echo "This server's public IP is: $SERVER_IP"
-echo "Please ensure you have an A record for $DOMAIN pointing to this IP in your Cloudflare DNS."
-echo "Waiting 60 seconds for DNS to propagate..."
+log_info "This server's public IP is: $SERVER_IP"
+log_warn "Please ensure you have an A record for $DOMAIN pointing to this IP in your Cloudflare DNS."
+log_warn "Waiting 60 seconds for DNS to propagate..."
 for i in {60..1}; do printf "\rWaiting... %2d" "$i"; sleep 1; done
-echo -e "\rDone waiting. Now checking DNS resolution.${NC}"
+echo -e "\rDone waiting. Now checking DNS resolution."
 
 RESOLVED_IP=$(dig +short "$DOMAIN" @1.1.1.1 || echo "")
-echo "Resolved IP for $DOMAIN is: ${YELLOW}${RESOLVED_IP:-Not found}${NC}"
+log_info "Resolved IP for $DOMAIN is: ${RESOLVED_IP:-Not found}"
 if [[ "$RESOLVED_IP" != "$SERVER_IP" ]]; then
-    echo -e "\n${RED}ERROR: DNS validation failed!${NC}" >&2
-    echo "The domain ${YELLOW}$DOMAIN${NC} does not resolve to this server's IP (${YELLOW}$SERVER_IP${NC})." >&2
-    echo "Please update your DNS A record in Cloudflare and run the script again." >&2
+    log_error "DNS validation failed!"
+    log_error "The domain $DOMAIN does not resolve to this server's IP ($SERVER_IP)."
+    log_error "Please update your DNS A record in Cloudflare and run the script again."
     exit 1
 fi
-echo -e "${GREEN}DNS validation successful!${NC}"
+log_info "DNS validation successful!"
 
 cat > "$RAYCONTROL_PATH" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- Paths ---
+DEBUG=false
+VERBOSE_FLAG=""
+if [[ "${1:-}" == "--debug" || "${1:-}" == "--verbose" ]]; then
+    DEBUG=true
+    VERBOSE_FLAG=$1
+    set -x
+    shift
+fi
+
+LOG_FILE="/var/log/raycontrol.log"
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+log_msg() {
+    local level_color="$1"
+    local level_text="$2"
+    local message="$3"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level_text] $message" >> "$LOG_FILE"
+    echo -e "${level_color}[$timestamp] [$level_text] ${message}${NC}"
+}
+log_info() {
+    log_msg "$GREEN" "INFO" "$1"
+}
+log_warn() {
+    log_msg "$YELLOW" "WARN" "$1"
+}
+log_error() {
+    log_msg "$RED" "ERROR" "$1" >&2
+}
+
 XRAY_DIR="/etc/xray"
 HYSTERIA_DIR="/etc/hysteria"
 RAY_AIO_DIR="/etc/ray-aio"
@@ -278,14 +345,8 @@ DB_IPS="${XRAY_DIR}/ips.db"
 ENABLED_FLAG="${XRAY_DIR}/enabled.flag"
 INSTALL_CONF="${RAY_AIO_DIR}/install.conf"
 SETTINGS_FILE="${RAY_AIO_DIR}/settings.json"
-
-# --- Constants ---
 NFT_TABLE="inet filter"
 NFT_SET="xray_clients"
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
 
 ensure_db(){
     mkdir -p "$XRAY_DIR" "$HYSTERIA_DIR" "$BACKUP_DIR"
@@ -298,9 +359,9 @@ ensure_db(){
 reload_services(){
     if [[ "$(cat "$ENABLED_FLAG")" == "enabled" ]]; then
         case "$1" in
-            xray) systemctl restart xray; echo -e "${GREEN}Xray service reloaded.${NC}" ;;
-            hysteria) systemctl restart hysteria-server; echo -e "${GREEN}Hysteria2 service reloaded.${NC}" ;;
-            *) systemctl restart xray; systemctl restart hysteria-server; echo -e "${GREEN}All services reloaded.${NC}" ;;
+            xray) systemctl restart xray; log_info "Xray service reloaded." ;;
+            hysteria) systemctl restart hysteria-server; log_info "Hysteria2 service reloaded." ;;
+            *) systemctl restart xray; systemctl restart hysteria-server; log_info "All services reloaded." ;;
         esac
     fi
 }
@@ -310,11 +371,12 @@ show_qr() {
     local id="$2"
 
     if ! command -v qrencode &> /dev/null; then
-        echo -e "${RED}Error: 'qrencode' is not installed. Please run 'apt install qrencode'.${NC}" >&2
+        log_error "Error: 'qrencode' is not installed. Please run 'apt install qrencode'."
         return 1
     fi
     if [ ! -f "$INSTALL_CONF" ] || [ ! -f "$SETTINGS_FILE" ]; then
-        echo -e "${RED}ERROR: Core config files not found in $RAY_AIO_DIR${NC}" >&2; exit 1;
+        log_error "Core config files not found in $RAY_AIO_DIR"
+        exit 1;
     fi
     source "$INSTALL_CONF"
     local vless_flow
@@ -336,21 +398,24 @@ show_qr() {
             ;;
         hysteria)
             if [[ -z "$id" ]]; then
-                echo -e "${RED}ERROR: Please provide a Hysteria password to generate a QR code.${NC}" >&2; exit 1;
+                log_error "Please provide a Hysteria password to generate a QR code."
+                exit 1;
             fi
             local obfs_pass
             obfs_pass=$(awk '/salamander:/,/password:/ {if ($1 == "password:") {print $2; exit}}' "$HYSTERIA_CONF")
             if [[ -z "$obfs_pass" ]]; then
-                echo -e "${RED}ERROR: Could not read Hysteria OBFS password from $HYSTERIA_CONF${NC}" >&2; exit 1;
+                log_error "Could not read Hysteria OBFS password from $HYSTERIA_CONF"
+                exit 1;
             fi
             name="${DOMAIN}-Hysteria2-${id:0:6}"
             uri="hysteria2://${id}@${DOMAIN}:${PORT_HYSTERIA}?sni=${DOMAIN}&obfs=salamander&obfs-password=${obfs_pass}#${name}"
             ;;
         *)
-            echo -e "${RED}Invalid type specified for QR code generation.${NC}" >&2; return 1;;
+            log_error "Invalid type specified for QR code generation."
+            return 1;;
     esac
 
-    echo -e "\n${YELLOW}--- QR Code for: $name ---${NC}"
+    log_warn "--- QR Code for: $name ---"
     qrencode -t ANSIUTF8 "$uri"
     echo -e "${YELLOW}URI: ${uri}${NC}\n"
 }
@@ -366,7 +431,7 @@ add_user(){
            '.inbounds[0].settings.clients += [{"id":$id,"flow":$flow}]' \
            "$XCONF" > "$XCONF.tmp" && mv "$XCONF.tmp" "$XCONF"
         echo "vless:$uuid" >> "$DB_XRAY_USERS"
-        echo -e "${GREEN}Added VLESS user: $uuid${NC}"
+        log_info "Added VLESS user: $uuid"
         reload_services xray
         show_qr vless "$uuid"
     elif [[ "$type" == "trojan" ]]; then
@@ -376,14 +441,14 @@ add_user(){
            '.inbounds[1].settings.clients += [{"password":$pw}]' \
            "$XCONF" > "$XCONF.tmp" && mv "$XCONF.tmp" "$XCONF"
         echo "trojan:$pass" >> "$DB_XRAY_USERS"
-        echo -e "${GREEN}Added Trojan user. Password: $pass${NC}"
+        log_info "Added Trojan user. Password: $pass"
         reload_services xray
         show_qr trojan "$pass"
     elif [[ "$type" == "hysteria" ]]; then
         local pass
         pass=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
         echo "$pass" >> "$DB_HY_USERS"
-        echo -e "${GREEN}Added Hysteria2 user. Password: $pass${NC}"
+        log_info "Added Hysteria2 user. Password: $pass"
         reload_services hysteria
         show_qr hysteria "$pass"
     else
@@ -398,20 +463,20 @@ del_user(){
         sed -i "\%^.*:$id.*%d" "$DB_XRAY_USERS"
         jq "del(.inbounds[] | .settings.clients[]? | select(.id == \"$id\" or .password == \"$id\"))" \
            "$XCONF" > "$XCONF.tmp" && mv "$XCONF.tmp" "$XCONF"
-        echo "Removed Xray user: $id"
+        log_info "Removed Xray user: $id"
         reload_services xray
     elif grep -qFx "$id" "$DB_HY_USERS"; then
         sed -i "\%^${id}\$%d" "$DB_HY_USERS"
-        echo "Removed Hysteria2 user: $id"
+        log_info "Removed Hysteria2 user: $id"
         reload_services hysteria
     else
-        echo "User not found: $id" >&2
+        log_error "User not found: $id"
         exit 1
     fi
 }
 
 list_users(){
-    echo -e "${YELLOW}--- Xray Users (VLESS/Trojan) ---${NC}"
+    log_warn "--- Xray Users (VLESS/Trojan) ---"
     if [[ ! -s "$DB_XRAY_USERS" ]]; then
         echo "(none)"
     else
@@ -422,7 +487,8 @@ list_users(){
         done < "$DB_XRAY_USERS"
     fi
 
-    echo -e "\n${YELLOW}--- Hysteria2 Users ---${NC}"
+    echo
+    log_warn "--- Hysteria2 Users ---"
     if [[ ! -s "$DB_HY_USERS" ]]; then
         echo "(none)"
     else
@@ -445,7 +511,7 @@ show_status(){ echo "Function show_status placeholder"; }
 
 help(){
     cat <<MSG
-Usage: raycontrol <command> [args]
+Usage: raycontrol <command> [args] [--debug|--verbose]
 
 Services Management:
   enable         Enable all services + firewall and persist rules
@@ -470,6 +536,10 @@ IP Whitelist Management:
   list-ips       List whitelisted IPs and their remaining timeout
   add-ip <IP>    Whitelist an IP
   del-ip <IP>    Remove a whitelisted IP
+
+Troubleshooting:
+  --debug        Enable syscall tracing and expanded output.
+  --verbose      Alias for --debug.
 MSG
 }
 
@@ -479,7 +549,7 @@ case "${1:-help}" in
   enable)      enable_all ;;
   disable)     disable_all ;;
   status)      show_status ;;
-  monitor)     watch -n 5 -t --color "$0" status ;;
+  monitor)     watch -n 5 -t --color "$0" "$VERBOSE_FLAG" status ;;
   backup)      backup_config ;;
   restore)     restore_config "${2:-}" ;;
   list-users)  list_users ;;
@@ -530,7 +600,7 @@ nft add rule inet filter knock drop
 EOF
 chmod +x "$APPLY_NFTABLES_SCRIPT"
 
-echo -e "\n${GREEN}--- Issuing Certificate with Certbot ---${NC}"
+log_info "--- Issuing Certificate with Certbot ---"
 mkdir -p "$SECRETS_DIR"
 cat > "$CLOUDFLARE_INI" <<EOF
 dns_cloudflare_api_token = $CF_API_TOKEN
@@ -543,7 +613,7 @@ certbot certonly \
   -m "$EMAIL" \
   -d "$DOMAIN"
 
-echo -e "\n${GREEN}--- Configuring Automatic Certificate Renewal ---${NC}"
+log_info "--- Configuring Automatic Certificate Renewal ---"
 mkdir -p "$LE_POST_HOOK_DIR"
 cat > "$LE_POST_HOOK_SCRIPT" <<'EOF'
 #!/usr/bin/env bash
@@ -555,7 +625,7 @@ fi
 EOF
 chmod +x "$LE_POST_HOOK_SCRIPT"
 
-echo -e "\n${GREEN}--- Installing Xray-core ---${NC}"
+log_info "--- Installing Xray-core ---"
 mkdir -p "$XRAY_DIR" "$XRAY_LOG_DIR"
 chown -R nobody:nogroup "$XRAY_DIR" "$XRAY_LOG_DIR"
 XRAY_VER=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
@@ -600,13 +670,13 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 
-echo -e "\n${GREEN}--- Installing Hysteria2 ---${NC}"
+log_info "--- Installing Hysteria2 ---"
 RAW_TAG=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r .tag_name)
 ENC_TAG=${RAW_TAG//\//%2F}
 DOWNLOAD_URL="https://github.com/apernet/hysteria/releases/download/${ENC_TAG}/hysteria-linux-amd64"
 wget -nv -O "$HYSTERIA_BIN" "$DOWNLOAD_URL"
 chmod +x "$HYSTERIA_BIN"
-echo -e "${GREEN}Hysteria2 installed successfully!${NC}"
+log_info "Hysteria2 installed successfully!"
 
 mkdir -p "$HYSTERIA_DIR"
 cat > "$HYSTERIA_CONFIG" <<EOF
@@ -659,7 +729,7 @@ TROJAN_URI="trojan://${PASSWORD_TROJAN}@${DOMAIN}:${PORT_TROJAN}?alpn=$(jq -r '.
 HYSTERIA_URI="hysteria2://${PASSWORD_HYSTERIA}@${DOMAIN}:${PORT_HYSTERIA}?sni=${DOMAIN}&obfs=salamander&obfs-password=${PASSWORD_HYSTERIA_OBFS}#${DOMAIN}-Hysteria2"
 
 trap - ERR EXIT
-echo -e "\n${GREEN}--- Installation successful! ---${NC}"
+log_info "--- Installation successful! ---"
 
 echo -e "\n\n${YELLOW}=====================================================${NC}"
 echo -e "${YELLOW}               ACTION REQUIRED TO ACTIVATE               ${NC}"
@@ -708,4 +778,5 @@ else
 fi
 
 echo -e "\nUse ${GREEN}'$RAYCONTROL_PATH help'${NC} for a full list of commands including status, backup, and restore."
+echo -e "For more detailed output, use the ${GREEN}'--debug'${NC} or ${GREEN}'--verbose'${NC} flag with any command."
 echo -e "\n${GREEN}=========================================================================================${NC}\n"
