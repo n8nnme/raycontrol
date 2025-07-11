@@ -83,7 +83,20 @@ apt install -y \
   curl wget unzip jq nftables certbot qrencode \
   python3-certbot-dns-cloudflare \
   uuid-runtime openssl socat gawk \
-  dnsutils uuid uuid-dev uuid-runtime uuidcdef ssl-cert conntrack
+  dnsutils uuid uuid-dev uuid-runtime uuidcdef ssl-cert conntrack \
+  bc numfmt watch
+
+# Create directories for config and backups
+mkdir -p /etc/ray-aio /var/backups/ray-aio
+
+# Save installation variables for backup and status commands
+cat > /etc/ray-aio/install.conf <<EOF
+DOMAIN="$DOMAIN"
+PORT_VLESS="$PORT_VLESS"
+PORT_TROJAN="$PORT_TROJAN"
+PORT_HYSTERIA="$PORT_HYSTERIA"
+SSH_PORT="$SSH_PORT"
+EOF
 
 if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
     echo -e "\n${GREEN}--- Setting up XanMod Repository ---${NC}"
@@ -168,9 +181,16 @@ NFT_SET="xray_clients"
 DB_USERS="/etc/xray/users.db"
 DB_IPS="/etc/xray/ips.db"
 ENABLED_FLAG="/etc/xray/enabled.flag"
+BACKUP_DIR="/var/backups/ray-aio"
+INSTALL_CONF="/etc/ray-aio/install.conf"
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
 
 ensure_db(){
-    mkdir -p /etc/xray
+    mkdir -p /etc/xray "$BACKUP_DIR"
     touch "$DB_USERS" "$DB_IPS"
     if [ ! -f "$ENABLED_FLAG" ]; then
         echo "disabled" > "$ENABLED_FLAG"
@@ -219,7 +239,7 @@ del_user(){
         jq "walk(
             if . == \"$id\" then empty
             else . end
-        ) | 
+        ) |
         .inbounds |= map(
             if .settings.clients then
                 .settings.clients |= map(select(
@@ -319,16 +339,124 @@ disable_all(){
     echo "All services and firewall disabled. Flushed rules have been persisted."
 }
 
+backup_config() {
+    local backup_file="$BACKUP_DIR/ray-aio-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+    echo "Starting backup..."
+    tar -czf "$backup_file" \
+        /etc/xray/ \
+        /etc/hysteria/ \
+        /etc/letsencrypt/ \
+        /usr/local/bin/raycontrol \
+        /usr/local/bin/apply_nftables_xray.sh \
+        /etc/ray-aio/ \
+        /etc/nftables.conf \
+        /etc/systemd/system/xray.service \
+        /etc/systemd/system/hysteria-server.service
+
+    echo -e "${GREEN}Backup complete! File saved to: $backup_file${NC}"
+}
+
+restore_config() {
+    local backup_file="$1"
+    if [[ ! -f "$backup_file" ]]; then
+        echo -e "${RED}ERROR: Backup file not found: $backup_file${NC}" >&2
+        exit 1
+    fi
+
+    echo -e "${YELLOW}WARNING: This will overwrite all current configurations and data.${NC}"
+    read -rp "Are you sure you want to restore from $backup_file? [y/N]: " confirm
+    if [[ "${confirm,,}" != "y" ]]; then
+        echo "Restore cancelled."
+        exit 0
+    fi
+
+    echo "Disabling services before restore..."
+    disable_all
+
+    echo "Restoring files..."
+    tar -xzf "$backup_file" -C /
+
+    echo "Reloading systemd..."
+    systemctl daemon-reload
+
+    echo -e "${GREEN}Restore complete!${NC}"
+    echo "Please review restored configurations."
+    echo "Run 'raycontrol enable' to restart services with the restored configuration."
+}
+
+show_status() {
+    source "$INSTALL_CONF"
+
+    # Helper for status text
+    get_status_text() {
+        if systemctl is-active --quiet "$1"; then
+            echo -e "${GREEN}active${NC}"
+        else
+            echo -e "${RED}inactive${NC}"
+        fi
+    }
+
+    # Helper to get bandwidth
+    get_bw() {
+        local counter_name=$1
+        local bytes
+        bytes=$(nft -j list ruleset | jq -r ".nftables[] | select(.rule) | .rule | select(.comment == \"$counter_name\") | .bytes")
+        if [[ -n "$bytes" && "$bytes" -gt 0 ]]; then
+            echo "$(numfmt --to=iec-i --suffix=B --format="%.2f" "$bytes")"
+        else
+            echo "0.00B"
+        fi
+    }
+
+    echo -e "${YELLOW}--- Service Status ---${NC}"
+    printf "%-18s: %s\n" "Xray" "$(get_status_text xray)"
+    printf "%-18s: %s\n" "Hysteria" "$(get_status_text hysteria-server)"
+    printf "%-18s: %s\n" "NFTables Firewall" "$(get_status_text nftables)"
+
+    echo -e "\n${YELLOW}--- Connection Info ---${NC}"
+    printf "%-18s: %s\n" "Domain" "$DOMAIN"
+    printf "%-18s: %s/tcp\n" "VLESS Port" "$PORT_VLESS"
+    printf "%-18s: %s/tcp\n" "Trojan Port" "$PORT_TROJAN"
+    printf "%-18s: %s/udp\n" "Hysteria Port" "$PORT_HYSTERIA"
+    printf "%-18s: %s/tcp\n" "SSH Port" "$SSH_PORT"
+
+    echo -e "\n${YELLOW}--- Monitoring ---${NC}"
+    if systemctl is-active --quiet nftables; then
+      local vless_conns trojan_conns hysteria_conns
+      vless_conns=$(conntrack -L -p tcp --dport "$PORT_VLESS" 2>/dev/null | grep -c ESTABLISHED || echo 0)
+      trojan_conns=$(conntrack -L -p tcp --dport "$PORT_TROJAN" 2>/dev/null | grep -c ESTABLISHED || echo 0)
+      hysteria_conns=$(conntrack -L -p udp --dport "$PORT_HYSTERIA" 2>/dev/null | grep -c ASSURED || echo 0)
+
+      printf "%-18s: %d\n" "VLESS Connections" "$vless_conns"
+      printf "%-18s: %d\n" "Trojan Connections" "$trojan_conns"
+      printf "%-18s: %d\n" "Hysteria Conns" "$hysteria_conns"
+      echo
+      printf "%-18s: %s\n" "VLESS Bandwidth" "$(get_bw vless_bw)"
+      printf "%-18s: %s\n" "Trojan Bandwidth" "$(get_bw trojan_bw)"
+      printf "%-18s: %s\n" "Hysteria Bandwidth" "$(get_bw hysteria_bw)"
+    else
+      echo "Firewall is inactive, cannot report monitoring stats."
+    fi
+}
+
 help(){
     cat <<MSG
 Usage: raycontrol <command> [args]
 Services Management:
   enable         Enable all services + firewall and persist rules
   disable        Disable all services + firewall and persist flushed rules
+  status         Show service states, connections, and bandwidth usage
+  monitor        Live monitor the status command (updates every 5s)
+
+Disaster Recovery:
+  backup         Create a full backup of all configurations
+  restore <file> Restore configuration from a backup archive
+
 Xray User Management:
   list-users     List VLESS/Trojan users
   add-user [vless|trojan]  Add a new VLESS or Trojan user
   del-user <ID>  Delete a user (automatically updates config.json)
+
 IP Whitelist Management:
   list-ips       List whitelisted IPs and their remaining timeout
   add-ip <IP>    Whitelist an IP
@@ -343,13 +471,17 @@ case "${1:-help}" in
   help)        help ;;
   enable)      enable_all ;;
   disable)     disable_all ;;
+  status)      show_status ;;
+  monitor)     watch -n 5 -t --color "$0" status ;;
+  backup)      backup_config ;;
+  restore)     restore_config "${2:-}" ;;
   list-users)  list_users ;;
   add-user)    add_user "${2:-}" ;;
-  del-user)    del_user "$2" ;;
+  del-user)    del_user "${2:-}" ;;
   list-ips)    list_ips ;;
-  add-ip)      add_ip "$2" ;;
-  del-ip)      del_ip "$2" ;;
-  check-conns) check_conns "$2" ;;
+  add-ip)      add_ip "${2:-}" ;;
+  del-ip)      del_ip "${2:-}" ;;
+  check-conns) check_conns "${2:-}" ;;
   *)           help ;;
 esac
 EOF
@@ -359,8 +491,16 @@ cat > /usr/local/bin/apply_nftables_xray.sh <<EOF
 #!/usr/bin/env bash
 set -e
 
-TCP_PORTS="$SSH_PORT,$PORT_VLESS,$PORT_TROJAN"
-UDP_PORTS="$PORT_HYSTERIA"
+# These variables are populated from the main install script's environment
+SSH_PORT="$SSH_PORT"
+PORT_VLESS="$PORT_VLESS"
+PORT_TROJAN="$PORT_TROJAN"
+PORT_HYSTERIA="$PORT_HYSTERIA"
+K1="$K1"
+K2="$K2"
+K3="$K3"
+
+TCP_PORTS_PROTECTED="$SSH_PORT,$PORT_VLESS,$PORT_TROJAN"
 
 nft flush ruleset
 
@@ -386,8 +526,12 @@ nft add rule inet filter input tcp dport $K3 ip saddr @knock_stage2 jump knock
 nft add rule inet filter knock add @xray_clients { ip saddr }
 nft add rule inet filter knock drop
 
-nft add rule inet filter input ip saddr @xray_clients tcp dport { $TCP_PORTS } counter update @xray_clients { ip saddr } accept
-nft add rule inet filter input ip saddr @xray_clients udp dport { $UDP_PORTS } counter update @xray_clients { ip saddr } accept
+# Add rules with named counters for bandwidth monitoring
+nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_VLESS counter update @xray_clients { ip saddr } accept comment "vless_bw"
+nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_TROJAN counter update @xray_clients { ip saddr } accept comment "trojan_bw"
+nft add rule inet filter input ip saddr @xray_clients udp dport $PORT_HYSTERIA counter update @xray_clients { ip saddr } accept comment "hysteria_bw"
+nft add rule inet filter input ip saddr @xray_clients tcp dport $SSH_PORT counter update @xray_clients { ip saddr } accept comment "ssh_bw"
+
 EOF
 chmod +x /usr/local/bin/apply_nftables_xray.sh
 
@@ -572,6 +716,5 @@ else
   echo "Hysteria2: $HYSTERIA_URI"
 fi
 
-echo -e "\nUse ${GREEN}'raycontrol help'${NC} to manage services and firewall."
-echo -e "\n${GREEN}=====================================================${NC}\n"
-
+echo -e "\nUse ${GREEN}'raycontrol help'${NC} for a full list of new commands including status, backup, and restore."
+echo -e "\n${GREEN}=========================================================================================${NC}\n"
