@@ -86,16 +86,17 @@ apt install -y \
   dnsutils uuid uuid-dev uuid-runtime uuidcdef ssl-cert conntrack \
   bc coreutils watch
 
-# Create directories for config and backups
 mkdir -p /etc/ray-aio /var/backups/ray-aio
 
-# Save installation variables for backup and status commands
 cat > /etc/ray-aio/install.conf <<EOF
 DOMAIN="$DOMAIN"
 PORT_VLESS="$PORT_VLESS"
 PORT_TROJAN="$PORT_TROJAN"
 PORT_HYSTERIA="$PORT_HYSTERIA"
 SSH_PORT="$SSH_PORT"
+K1="$K1"
+K2="$K2"
+K3="$K3"
 EOF
 
 if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
@@ -317,33 +318,34 @@ del_ip(){
 }
 
 apply_nftables(){
+    if [ ! -f "$INSTALL_CONF" ]; then
+        echo -e "${RED}ERROR: Install config not found at $INSTALL_CONF${NC}" >&2
+        return 1
+    fi
+    source "$INSTALL_CONF"
+
     nft flush ruleset
     nft add table inet filter
-    nft add chain inet filter input  '{ type filter hook input priority 0; policy drop; }'
+    nft add chain inet filter input '{ type filter hook input priority 0; policy drop; }'
     nft add chain inet filter forward '{ type filter hook forward priority 0; policy drop; }'
     nft add chain inet filter output '{ type filter hook output priority 0; policy accept; }'
-
-    nft add rule inet filter input iif lo accept
-    nft add rule inet filter input ct state established,related accept
-    nft add rule inet filter input ip protocol icmp accept
-    nft add rule inet filter input ip6 nexthdr ipv6-icmp accept
-
     nft add set inet filter knock_stage1 '{ type ipv4_addr; flags dynamic; timeout 10s; }'
     nft add set inet filter knock_stage2 '{ type ipv4_addr; flags dynamic; timeout 10s; }'
     nft add set inet filter xray_clients '{ type ipv4_addr; flags dynamic; timeout 10m; }'
     nft add chain inet filter knock
-
-    nft add rule inet filter input tcp dport $K1 add @knock_stage1 '{ ip saddr }' drop
-    nft add rule inet filter input tcp dport $K2 ip saddr @knock_stage1 add @knock_stage2 '{ ip saddr }' drop
-    nft add rule inet filter input tcp dport $K3 ip saddr @knock_stage2 jump knock
-
-    nft add rule inet filter knock add @xray_clients '{ ip saddr }'
-    nft add rule inet filter knock drop
-
+    nft add rule inet filter input iif lo accept
     nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_VLESS counter update @xray_clients '{ ip saddr }' accept comment "vless_bw"
     nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_TROJAN counter update @xray_clients '{ ip saddr }' accept comment "trojan_bw"
     nft add rule inet filter input ip saddr @xray_clients udp dport $PORT_HYSTERIA counter update @xray_clients '{ ip saddr }' accept comment "hysteria_bw"
     nft add rule inet filter input ip saddr @xray_clients tcp dport $SSH_PORT counter update @xray_clients '{ ip saddr }' accept comment "ssh_bw"
+    nft add rule inet filter input ct state established,related accept
+    nft add rule inet filter input ip protocol icmp accept
+    nft add rule inet filter input ip6 nexthdr ipv6-icmp accept
+    nft add rule inet filter input tcp dport $K1 add @knock_stage1 '{ ip saddr }' drop
+    nft add rule inet filter input tcp dport $K2 ip saddr @knock_stage1 add @knock_stage2 '{ ip saddr }' drop
+    nft add rule inet filter input tcp dport $K3 ip saddr @knock_stage2 jump knock
+    nft add rule inet filter knock add @xray_clients '{ ip saddr }'
+    nft add rule inet filter knock drop
 }
 
 enable_all(){
@@ -483,7 +485,6 @@ IP Whitelist Management:
 MSG
 }
 
-# Main entry
 ensure_db
 case "${1:-help}" in
   help)        help ;;
@@ -509,7 +510,6 @@ cat > /usr/local/bin/apply_nftables_xray.sh <<EOF
 #!/usr/bin/env bash
 set -e
 
-# These variables are populated from the main install script's environment
 SSH_PORT="$SSH_PORT"
 PORT_VLESS="$PORT_VLESS"
 PORT_TROJAN="$PORT_TROJAN"
@@ -518,27 +518,31 @@ K1="$K1"
 K2="$K2"
 K3="$K3"
 
-TCP_PORTS_PROTECTED="$SSH_PORT,$PORT_VLESS,$PORT_TROJAN"
-
 nft flush ruleset
 
 nft add table inet filter
 
-nft add chain inet filter input  '{ type filter hook input priority 0; policy drop; }'
+nft add chain inet filter input '{ type filter hook input priority 0; policy drop; }'
 nft add chain inet filter forward '{ type filter hook forward priority 0; policy drop; }'
 nft add chain inet filter output '{ type filter hook output priority 0; policy accept; }'
-
-nft add rule inet filter input iif lo accept
-nft add rule inet filter input ct state established,related accept
-nft add rule inet filter input ip protocol icmp accept
-nft add rule inet filter input ip6 nexthdr ipv6-icmp accept
 
 nft add set inet filter knock_stage1 '{ type ipv4_addr; flags dynamic; timeout 10s; }'
 nft add set inet filter knock_stage2 '{ type ipv4_addr; flags dynamic; timeout 10s; }'
 nft add set inet filter xray_clients '{ type ipv4_addr; flags dynamic; timeout 10m; }'
 
-# Define the custom “knock” chain (no hook needed)
 nft add chain inet filter knock
+
+nft add rule inet filter input iif lo accept
+
+nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_VLESS counter update @xray_clients '{ ip saddr }' accept comment "vless_bw"
+nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_TROJAN counter update @xray_clients '{ ip saddr }' accept comment "trojan_bw"
+nft add rule inet filter input ip saddr @xray_clients udp dport $PORT_HYSTERIA counter update @xray_clients '{ ip saddr }' accept comment "hysteria_bw"
+nft add rule inet filter input ip saddr @xray_clients tcp dport $SSH_PORT counter update @xray_clients '{ ip saddr }' accept comment "ssh_bw"
+
+nft add rule inet filter input ct state established,related accept
+
+nft add rule inet filter input ip protocol icmp accept
+nft add rule inet filter input ip6 nexthdr ipv6-icmp accept
 
 nft add rule inet filter input tcp dport $K1 add @knock_stage1 '{ ip saddr }' drop
 nft add rule inet filter input tcp dport $K2 ip saddr @knock_stage1 add @knock_stage2 '{ ip saddr }' drop
@@ -546,12 +550,6 @@ nft add rule inet filter input tcp dport $K3 ip saddr @knock_stage2 jump knock
 
 nft add rule inet filter knock add @xray_clients '{ ip saddr }'
 nft add rule inet filter knock drop
-
-# Add rules with named counters for bandwidth monitoring
-nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_VLESS counter update @xray_clients '{ ip saddr }' accept comment "vless_bw"
-nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_TROJAN counter update @xray_clients '{ ip saddr }' accept comment "trojan_bw"
-nft add rule inet filter input ip saddr @xray_clients udp dport $PORT_HYSTERIA counter update @xray_clients '{ ip saddr }' accept comment "hysteria_bw"
-nft add rule inet filter input ip saddr @xray_clients tcp dport $SSH_PORT counter update @xray_clients '{ ip saddr }' accept comment "ssh_bw"
 EOF
 chmod +x /usr/local/bin/apply_nftables_xray.sh
 
