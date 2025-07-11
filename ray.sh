@@ -1,19 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- Colors for Output ---
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# 1. Ensure running as root
 if [[ $EUID -ne 0 ]]; then
   echo -e "${RED}ERROR: This script must be run as root.${NC}" >&2
   exit 1
 fi
 
-# 2. Prompt for core parameters
 read -rp "Domain (e.g. your.domain.com): " DOMAIN
 read -rp "Cloudflare API Token: " CF_API_TOKEN
 read -rp "Let’s Encrypt email: " EMAIL
@@ -34,7 +31,6 @@ PORT_TROJAN=${PORT_TROJAN:-8443}
 read -rp "Port for Hysteria2 (UDP, 200-65535, default 3478): " PORT_HYSTERIA
 PORT_HYSTERIA=${PORT_HYSTERIA:-3478}
 
-# Validate port ranges
 for P in K1 K2 K3 PORT_VLESS PORT_TROJAN PORT_HYSTERIA; do
   VAL=${!P}
   if ! [[ "$VAL" =~ ^[0-9]+$ ]] || (( VAL<1 || VAL>65535 )); then
@@ -46,7 +42,6 @@ done
 echo
 read -rp "Install XanMod kernel for BBRv3 and other optimizations? [y/N]: " INSTALL_XANMOD
 
-# 3. Pre-flight Checks & Confirmation
 echo -e "\n${GREEN}--- Pre-flight Checks ---${NC}"
 SSH_PORT=$(ss -tnlp | awk '/sshd/ && /LISTEN/ { sub(".*:", "", $4); print $4; exit }')
 echo "Detected SSH port: $SSH_PORT"
@@ -82,21 +77,20 @@ if [[ "${CONFIRM,,}" != "y" ]]; then
     exit 1
 fi
 
-# 4. Install Dependencies & XanMod
 echo -e "\n${GREEN}--- Installing Core Dependencies ---${NC}"
 apt update
 apt install -y \
-  curl wget unzip jq iptables ipset certbot qrencode \
+  curl wget unzip jq nftables certbot qrencode \
   python3-certbot-dns-cloudflare \
-  uuid-runtime openssl socat iptables-persistent gawk \
-  dnsutils uuid uuid-dev uuid-runtime uuidcdef ssl-cert
+  uuid-runtime openssl socat gawk \
+  dnsutils uuid uuid-dev uuid-runtime uuidcdef ssl-cert conntrack
 
 if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
     echo -e "\n${GREEN}--- Setting up XanMod Repository ---${NC}"
     apt install -y gpg
     echo 'deb http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-kernel.list
     wget -qO - https://dl.xanmod.org/gpg.key | gpg --dearmor -o /etc/apt/trusted.gpg.d/xanmod-kernel.gpg
-    
+
     echo -e "\n${GREEN}--- Updating sources for XanMod ---${NC}"
     apt update
 
@@ -114,31 +108,29 @@ BEGIN {
 }
 AWK
     chmod +x /tmp/check_x86_v_level.awk
-    
-    XANMOD_PKG_NAME="linux-xanmod-lts-x64v1" # Default
+
+    XANMOD_PKG_NAME="linux-xanmod-lts-x64v1"
     CPU_LEVEL_EXIT_CODE=0
     /tmp/check_x86_v_level.awk || CPU_LEVEL_EXIT_CODE=$?
-    
+
     case $CPU_LEVEL_EXIT_CODE in
         3) XANMOD_PKG_NAME="linux-xanmod-x64v2" ;;
         4) XANMOD_PKG_NAME="linux-xanmod-x64v3" ;;
         5) XANMOD_PKG_NAME="linux-xanmod-x64v3" ;;
         *) XANMOD_PKG_NAME="linux-xanmod-lts-x64v1" ;;
     esac
-    
+
     echo -e "\n${GREEN}--- Installing XanMod Kernel ($XANMOD_PKG_NAME) ---${NC}"
     apt install -y "$XANMOD_PKG_NAME"
     rm -f /tmp/check_x86_v_level.awk
 fi
 
-# 5. Generate credentials & paths
 UUID_VLESS=$(uuidgen)
 PASSWORD_TROJAN=$(head -c16 /dev/urandom | base64 | tr '+/' '_-' | cut -c1-16)
 PASSWORD_HYSTERIA=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
 PASSWORD_HYSTERIA_OBFS=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
 WEBPATH_TROJAN=$(head -c64 /dev/urandom | tr -dc 'A-Za-z0-9')
 
-# 6. DNS Validation
 echo -e "\n${GREEN}--- Validating DNS Records ---${NC}"
 SERVER_IP=$(curl -s https://ipwho.de/ip)
 if [[ -z "$SERVER_IP" ]]; then
@@ -166,12 +158,12 @@ if [[ "$RESOLVED_IP" != "$SERVER_IP" ]]; then
 fi
 echo -e "${GREEN}DNS validation successful!${NC}"
 
-# 7. Write raycontrol CLI
 cat > /usr/local/bin/raycontrol <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 XCONF="/etc/xray/config.json"
-IPSET="xray_clients"
+NFT_TABLE="inet filter"
+NFT_SET="xray_clients"
 DB_USERS="/etc/xray/users.db"
 DB_IPS="/etc/xray/ips.db"
 ENABLED_FLAG="/etc/xray/enabled.flag"
@@ -215,31 +207,58 @@ list_users(){
   column -t -s: "$DB_USERS" || echo "(none)"
 }
 list_ips(){
-  echo "=== Whitelisted IPs ==="
-  ipset list $IPSET | awk '/Members:/{f=1;next} f' || echo "(none)"
+  echo "=== Whitelisted IPs (with remaining timeout) ==="
+  local elements
+  elements=$(nft list set $NFT_TABLE $NFT_SET | grep 'elements =' | sed 's/^[ \t]*elements = { //; s/ }$//')
+  if [[ -z "$elements" ]]; then
+    echo "(none)"
+  else
+    echo "$elements" | tr ',' '\n' | sed 's/^[ ]*//'
+  fi
+}
+check_conns(){
+  ip=$1
+  if [[ -z "$ip" ]]; then
+    echo "Usage: raycontrol check-conns <IP>" >&2; exit 1
+  fi
+  if ! command -v conntrack &> /dev/null; then
+    echo "Error: conntrack-tools is not installed. (apt install conntrack)" >&2; exit 1
+  fi
+  echo "--- Active Connections for $ip ---"
+  conntrack -L -s "$ip" -o extended || echo "No active connections found."
 }
 add_ip(){
-  ip=$1; ipset add $IPSET "$ip"; echo "$ip" >>"$DB_IPS"
+  ip=$1; nft add element $NFT_TABLE $NFT_SET { "$ip" }; echo "$ip" >>"$DB_IPS"
   echo "Whitelisted IP $ip"
 }
 del_ip(){
-  ip=$1; ipset del $IPSET "$ip"; sed -i "\:^$ip\$d" "$DB_IPS"
-  echo "Removed IP $ip"
+  ip=$1
+  handle=$(nft -a list set $NFT_TABLE $NFT_SET | grep "$ip" | awk '{print $NF}');
+  if [ -n "$handle" ]; then
+    nft delete element $NFT_TABLE $NFT_SET { handle $handle };
+    sed -i "\:^$ip\$d" "$DB_IPS"
+    echo "Removed IP $ip"
+  else
+    echo "IP $ip not found in set."
+  fi
 }
 enable_all(){
   echo "enabled" > "$ENABLED_FLAG"
-  bash /usr/local/bin/apply_iptables_xray.sh
+  bash /usr/local/bin/apply_nftables_xray.sh
+  systemctl enable nftables
+  systemctl start nftables
   systemctl start xray
   systemctl start hysteria-server
-  iptables-save > /etc/iptables/rules.v4
+  nft -s list ruleset > /etc/nftables.conf
   echo "All services and firewall enabled and persisted."
 }
 disable_all(){
   echo "disabled" > "$ENABLED_FLAG"
   systemctl stop hysteria-server
   systemctl stop xray
-  iptables -F
-  iptables-save > /etc/iptables/rules.v4
+  systemctl stop nftables
+  nft flush ruleset
+  nft -s list ruleset > /etc/nftables.conf
   echo "All services and firewall disabled. Flushed rules have been persisted."
 }
 help(){
@@ -253,9 +272,10 @@ Xray User Management:
   add-user [vless|trojan] Add a new VLESS or Trojan user
   del-user <ID>  Delete a user from the local DB (manual xray config edit required)
 IP Whitelist Management:
-  list-ips       List whitelisted IPs for port knocking
+  list-ips       List whitelisted IPs and their remaining timeout
   add-ip <IP>    Whitelist an IP
   del-ip <IP>    Remove a whitelisted IP
+  check-conns <IP> Check active connections for a specific IP
 MSG
 }
 ensure_db
@@ -269,40 +289,48 @@ case "${1:-help}" in
   list-ips)    list_ips ;;
   add-ip)      add_ip "$2" ;;
   del-ip)      del_ip "$2" ;;
+  check-conns) check_conns "$2" ;;
   *)           help ;;
 esac
 EOF
 chmod +x /usr/local/bin/raycontrol
 
-# 8. Prepare Apply-Firewall script
-cat > /usr/local/bin/apply_iptables_xray.sh <<EOF
+cat > /usr/local/bin/apply_nftables_xray.sh <<EOF
 #!/usr/bin/env bash
 set -e
-TCP_PORTS="$SSH_PORT $PORT_VLESS $PORT_TROJAN"
-UDP_PORTS="$PORT_HYSTERIA"
-iptables -P INPUT DROP; iptables -P FORWARD DROP; iptables -P OUTPUT ACCEPT
-iptables -F && iptables -X
-iptables -A INPUT -i lo -j ACCEPT
-iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-iptables -A INPUT -p icmp -j ACCEPT
-ipset create xray_clients hash:ip timeout 600 --exist
-iptables -N KNOCK 2>/dev/null || iptables -F KNOCK
-iptables -A INPUT -p tcp --dport $K1 -m recent --set --name K1 --rsource -j DROP
-iptables -A INPUT -p tcp --dport $K2 -m recent --rcheck --seconds 10 --name K1 --rsource -m recent --set --name K2 --rsource -j DROP
-iptables -A INPUT -p tcp --dport $K3 -m recent --rcheck --seconds 10 --name K2 --rsource -j KNOCK
-iptables -A KNOCK -m recent --remove --name K1 --rsource -j SET --add-set xray_clients src --exist
-iptables -A KNOCK -m recent --remove --name K2 --rsource -j SET --add-set xray_clients src --exist
-iptables -A KNOCK -j DROP
-for P in \$TCP_PORTS; do
-  iptables -A INPUT -p tcp --dport \$P -m set --match-set xray_clients src -j ACCEPT
-done
-for P in \$UDP_PORTS; do
-  iptables -A INPUT -p udp --dport \$P -m set --match-set xray_clients src -j ACCEPT
-done
-EOF
-chmod +x /usr/local/bin/apply_iptables_xray.sh
 
-# 9. Certificate issuance
+TCP_PORTS="$SSH_PORT,$PORT_VLESS,$PORT_TROJAN"
+UDP_PORTS="$PORT_HYSTERIA"
+
+nft flush ruleset
+
+nft add table inet filter
+nft add chain inet filter input { type filter hook input priority 0; policy drop; }
+nft add chain inet filter forward { type filter hook forward priority 0; policy drop; }
+nft add chain inet filter output { type filter hook output priority 0; policy accept; }
+
+nft add rule inet filter input iif lo accept
+nft add rule inet filter input ct state established,related accept
+nft add rule inet filter input ip protocol icmp accept
+nft add rule inet filter input ip6 nexthdr ipv6-icmp accept
+
+nft add set inet filter knock_stage1 { type ipv4_addr; flags dynamic; timeout 10s; }
+nft add set inet filter knock_stage2 { type ipv4_addr; flags dynamic; timeout 10s; }
+nft add set inet filter xray_clients { type ipv4_addr; flags dynamic; timeout 10m; }
+nft add chain inet filter knock
+
+nft add rule inet filter input tcp dport $K1 add @knock_stage1 { ip saddr } drop
+nft add rule inet filter input tcp dport $K2 ip saddr @knock_stage1 add @knock_stage2 { ip saddr } drop
+nft add rule inet filter input tcp dport $K3 ip saddr @knock_stage2 jump knock
+
+nft add rule inet filter knock add @xray_clients { ip saddr }
+nft add rule inet filter knock drop
+
+nft add rule inet filter input ip saddr @xray_clients tcp dport { $TCP_PORTS } counter update @xray_clients { ip saddr } accept
+nft add rule inet filter input ip saddr @xray_clients udp dport { $UDP_PORTS } counter update @xray_clients { ip saddr } accept
+EOF
+chmod +x /usr/local/bin/apply_nftables_xray.sh
+
 echo -e "\n${GREEN}--- Issuing Certificate with Certbot ---${NC}"
 mkdir -p /root/.secrets
 cat > /root/.secrets/cloudflare.ini <<EOF
@@ -316,7 +344,6 @@ certbot certonly \
   -m "$EMAIL" \
   -d "$DOMAIN"
 
-# 10. Create Certbot renewal hook
 echo -e "\n${GREEN}--- Configuring Automatic Certificate Renewal ---${NC}"
 mkdir -p /etc/letsencrypt/renewal-hooks/post
 cat > /etc/letsencrypt/renewal-hooks/post/reload_services.sh <<'EOF'
@@ -328,7 +355,6 @@ fi
 EOF
 chmod +x /etc/letsencrypt/renewal-hooks/post/reload_services.sh
 
-# 11. Install Xray-core
 echo -e "\n${GREEN}--- Installing Xray-core ---${NC}"
 mkdir -p /etc/xray /var/log/xray
 chown -R nobody:nogroup /etc/xray /var/log/xray
@@ -338,7 +364,6 @@ wget -qO /tmp/Xray-linux-64.zip "https://github.com/XTLS/Xray-core/releases/down
   && rm /tmp/Xray-linux-64.zip
 chmod +x /usr/local/bin/xray
 
-# 12. Configure Xray
 cat > /etc/xray/config.json <<EOF
 {
   "log": {"loglevel": "warning"},
@@ -359,7 +384,6 @@ cat > /etc/xray/config.json <<EOF
 }
 EOF
 
-# 13. Setup Xray systemd service
 cat > /etc/systemd/system/xray.service <<EOF
 [Unit]
 Description=Xray Service
@@ -375,7 +399,6 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 
-# 14. Install Hysteria2
 echo -e "\n${GREEN}--- Installing Hysteria2 ---${NC}"
 
 RAW_TAG=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest \
@@ -395,7 +418,6 @@ fi
 chmod +x /usr/local/bin/hysteria-server
 echo -e "${GREEN}Hysteria2 installed successfully!${NC}"
 
-# 15. Configure Hysteria2
 mkdir -p /etc/hysteria
 cat > /etc/hysteria/config.yaml <<EOF
 listen: :$PORT_HYSTERIA
@@ -416,7 +438,6 @@ masquerade:
     rewriteHost: true
 EOF
 
-# 16. Setup Hysteria2 systemd service
 cat > /etc/systemd/system/hysteria-server.service <<EOF
 [Unit]
 Description=Hysteria2 Service
@@ -432,8 +453,6 @@ Restart=on-failure
 WantedBy=multi-user.target
 EOF
 
-# 17. Finalize installation
-
 usermod -aG ssl-cert nobody
 chgrp -R ssl-cert /etc/letsencrypt/live /etc/letsencrypt/archive
 chmod -R g+rx /etc/letsencrypt/live /etc/letsencrypt/archive
@@ -443,7 +462,6 @@ systemctl enable xray
 systemctl enable hysteria-server
 echo -e "\n${GREEN}--- Installation of all files is complete. ---${NC}"
 
-# 18. Final Info
 VLESS_URI="vless://${UUID_VLESS}@${DOMAIN}:${PORT_VLESS}?type=tcp&security=xtls&flow=xtls-rprx-vision&alpn=h2&sni=${DOMAIN}#${DOMAIN}-VLESS"
 TROJAN_URI="trojan://${PASSWORD_TROJAN}@${DOMAIN}:${PORT_TROJAN}?alpn=h2&sni=${DOMAIN}#${DOMAIN}-Trojan"
 HYSTERIA_URI="hysteria2://${PASSWORD_HYSTERIA}@${DOMAIN}:${PORT_HYSTERIA}?sni=${DOMAIN}&obfs=salamander&obfs-password=${PASSWORD_HYSTERIA_OBFS}#${DOMAIN}-Hysteria2"
@@ -462,6 +480,7 @@ else
 fi
 echo -e "After enabling, your system will be fully configured and ready."
 echo -e "Your IP will not be whitelisted automatically. You must perform the port knock first."
+echo -e "An IP will be removed from the whitelist after 10 minutes of inactivity."
 
 echo -e "\n${YELLOW}--- Connection Info (once enabled) ---${NC}"
 echo "Knock sequence for all services: $K1 -> $K2 -> $K3"
@@ -495,3 +514,4 @@ fi
 
 echo -e "\nUse ${GREEN}'raycontrol help'${NC} to manage services and firewall."
 echo -e "\n${GREEN}=====================================================${NC}\n"
+
