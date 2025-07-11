@@ -161,6 +161,7 @@ echo -e "${GREEN}DNS validation successful!${NC}"
 cat > /usr/local/bin/raycontrol <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+
 XCONF="/etc/xray/config.json"
 NFT_TABLE="inet filter"
 NFT_SET="xray_clients"
@@ -169,108 +170,165 @@ DB_IPS="/etc/xray/ips.db"
 ENABLED_FLAG="/etc/xray/enabled.flag"
 
 ensure_db(){
-  mkdir -p /etc/xray
-  touch "$DB_USERS" "$DB_IPS"
-  if [ ! -f "$ENABLED_FLAG" ]; then
-      echo "disabled" > "$ENABLED_FLAG"
-  fi
+    mkdir -p /etc/xray
+    touch "$DB_USERS" "$DB_IPS"
+    if [ ! -f "$ENABLED_FLAG" ]; then
+        echo "disabled" > "$ENABLED_FLAG"
+    fi
 }
+
 reload_xray(){
-  if [[ "$(cat $ENABLED_FLAG)" == "enabled" ]]; then
-    systemctl restart xray
-  fi
+    if [[ "$(cat "$ENABLED_FLAG")" == "enabled" ]]; then
+        systemctl restart xray
+    fi
 }
+
 add_user(){
-  type=${1:-}
-  if [[ $type == "vless" ]]; then
-    uuid=$(uuidgen)
-    jq --arg id "$uuid" '.inbounds[0].settings.clients += [{"id":$id,"flow":"xtls-rprx-vision"}]' "$XCONF" > tmp && mv tmp "$XCONF"
-    echo "vless:$uuid:h2-only" >>"$DB_USERS"
-    echo "Added VLESS user $uuid"
-  elif [[ $type == "trojan" ]]; then
-    pass=$(head -c16 /dev/urandom | base64 | tr '+/' '_-' | cut -c1-16)
-    path=$(head -c64 /dev/urandom | tr -dc 'A-Za-z0-9')
-    jq --arg pw "$pass" --arg p "/$path" '.inbounds[1].settings.clients += [{"password":$pw}] | .inbounds[1].settings.fallbacks += [{"path":$p,"dest":6001,"xver":1}]' "$XCONF" > tmp && mv tmp "$XCONF"
-    echo "trojan:$pass:$path" >>"$DB_USERS"
-    echo "Added Trojan user with path /$path"
-  else
-    echo "Usage: raycontrol add-user [vless|trojan]" >&2; exit 1
-  fi
-  reload_xray
+    local type="$1"
+    if [[ "$type" == "vless" ]]; then
+        local uuid
+        uuid=$(uuidgen)
+        jq --arg id "$uuid" \
+           '.inbounds[0].settings.clients += [{"id":$id,"flow":"xtls-rprx-vision"}]' \
+           "$XCONF" > "$XCONF.tmp" && mv "$XCONF.tmp" "$XCONF"
+        echo "vless:$uuid" >> "$DB_USERS"
+        echo "Added VLESS user: $uuid"
+    elif [[ "$type" == "trojan" ]]; then
+        local pass path
+        pass=$(head -c16 /dev/urandom | base64 | tr '+/' '_-' | cut -c1-16)
+        path=$(head -c64 /dev/urandom | tr -dc 'A-Za-z0-9')
+        jq --arg pw "$pass" --arg p "/$path" \
+           '.inbounds[1].settings.clients += [{"password":$pw}] |
+            .inbounds[1].settings.fallbacks += [{"path":$p,"dest":6001,"xver":1}]' \
+           "$XCONF" > "$XCONF.tmp" && mv "$XCONF.tmp" "$XCONF"
+        echo "trojan:$pass:$path" >> "$DB_USERS"
+        echo "Added Trojan user: $path"
+    else
+        echo "Usage: raycontrol add-user [vless|trojan]" >&2
+        exit 1
+    fi
+    reload_xray
 }
+
 del_user(){
-  id=$1; sed -i "\:^.*$id.*\$d" "$DB_USERS"
-  echo "Removed user '$id' from DB. Manual edit of $XCONF is required."
+    local id="$1"
+    if grep -qE "^(vless|trojan):$id" "$DB_USERS"; then
+        # remove from DB
+        sed -i "\%^.*:$id.*\$%d" "$DB_USERS"
+        # remove from config.json
+        jq "walk(
+            if . == \"$id\" then empty
+            else . end
+        ) | 
+        .inbounds |= map(
+            if .settings.clients then
+                .settings.clients |= map(select(
+                    (has(\"id\") and .id != \"$id\")
+                    or (has(\"password\") and .password != \"$id\")
+                ))
+            else .
+            end
+        )" \
+        "$XCONF" > "$XCONF.tmp" && mv "$XCONF.tmp" "$XCONF"
+        echo "Removed user: $id"
+        reload_xray
+    else
+        echo "User not found: $id" >&2
+        exit 1
+    fi
 }
+
 list_users(){
-  echo "=== Xray Users (type:id/pass:path) ==="
-  column -t -s: "$DB_USERS" || echo "(none)"
+    if [[ ! -s "$DB_USERS" ]]; then
+        echo "(none)"
+        return
+    fi
+    echo "TYPE    ID/PASS    PATH"
+    while IFS=":" read -r type id rest; do
+        if [[ "$type" == "vless" ]]; then
+            printf "vless   %s\n" "$id"
+        else
+            printf "trojan  %s    /%s\n" "$id" "$rest"
+        fi
+    done < "$DB_USERS"
 }
+
 list_ips(){
-  echo "=== Whitelisted IPs (with remaining timeout) ==="
-  local elements
-  elements=$(nft list set $NFT_TABLE $NFT_SET | grep 'elements =' | sed 's/^[ \t]*elements = { //; s/ }$//')
-  if [[ -z "$elements" ]]; then
-    echo "(none)"
-  else
-    echo "$elements" | tr ',' '\n' | sed 's/^[ ]*//'
-  fi
+    echo "=== Whitelisted IPs (with remaining timeout) ==="
+    local elements
+    elements=$(nft list set $NFT_TABLE $NFT_SET | grep 'elements =' | sed 's/^[ \t]*elements = { //; s/ }$//')
+    if [[ -z "$elements" ]]; then
+        echo "(none)"
+    else
+        echo "$elements" | tr ',' '\n' | sed 's/^[ ]*//'
+    fi
 }
+
 check_conns(){
-  ip=$1
-  if [[ -z "$ip" ]]; then
-    echo "Usage: raycontrol check-conns <IP>" >&2; exit 1
-  fi
-  if ! command -v conntrack &> /dev/null; then
-    echo "Error: conntrack-tools is not installed. (apt install conntrack)" >&2; exit 1
-  fi
-  echo "--- Active Connections for $ip ---"
-  conntrack -L -s "$ip" -o extended || echo "No active connections found."
+    local ip="$1"
+    if [[ -z "$ip" ]]; then
+        echo "Usage: raycontrol check-conns <IP>" >&2
+        exit 1
+    fi
+    if ! command -v conntrack &> /dev/null; then
+        echo "Error: conntrack-tools is not installed. (apt install conntrack)" >&2
+        exit 1
+    fi
+    echo "--- Active Connections for $ip ---"
+    conntrack -L -s "$ip" -o extended || echo "No active connections found."
 }
+
 add_ip(){
-  ip=$1; nft add element $NFT_TABLE $NFT_SET { "$ip" }; echo "$ip" >>"$DB_IPS"
-  echo "Whitelisted IP $ip"
+    local ip="$1"
+    nft add element $NFT_TABLE $NFT_SET { "$ip" }
+    echo "$ip" >> "$DB_IPS"
+    echo "Whitelisted IP $ip"
 }
+
 del_ip(){
-  ip=$1
-  handle=$(nft -a list set $NFT_TABLE $NFT_SET | grep "$ip" | awk '{print $NF}');
-  if [ -n "$handle" ]; then
-    nft delete element $NFT_TABLE $NFT_SET { handle $handle };
-    sed -i "\:^$ip\$d" "$DB_IPS"
-    echo "Removed IP $ip"
-  else
-    echo "IP $ip not found in set."
-  fi
+    local ip="$1"
+    local handle
+    handle=$(nft -a list set $NFT_TABLE $NFT_SET | grep "$ip" | awk '{print $NF}')
+    if [[ -n "$handle" ]]; then
+        nft delete element $NFT_TABLE $NFT_SET { handle $handle }
+        sed -i "\%^$ip\$%d" "$DB_IPS"
+        echo "Removed IP $ip"
+    else
+        echo "IP $ip not found in set."
+    fi
 }
+
 enable_all(){
-  echo "enabled" > "$ENABLED_FLAG"
-  bash /usr/local/bin/apply_nftables_xray.sh
-  systemctl enable nftables
-  systemctl start nftables
-  systemctl start xray
-  systemctl start hysteria-server
-  nft -s list ruleset > /etc/nftables.conf
-  echo "All services and firewall enabled and persisted."
+    echo "enabled" > "$ENABLED_FLAG"
+    bash /usr/local/bin/apply_nftables_xray.sh
+    systemctl enable nftables
+    systemctl start nftables
+    systemctl start xray
+    systemctl start hysteria-server
+    nft -s list ruleset > /etc/nftables.conf
+    echo "All services and firewall enabled and persisted."
 }
+
 disable_all(){
-  echo "disabled" > "$ENABLED_FLAG"
-  systemctl stop hysteria-server
-  systemctl stop xray
-  systemctl stop nftables
-  nft flush ruleset
-  nft -s list ruleset > /etc/nftables.conf
-  echo "All services and firewall disabled. Flushed rules have been persisted."
+    echo "disabled" > "$ENABLED_FLAG"
+    systemctl stop hysteria-server
+    systemctl stop xray
+    systemctl stop nftables
+    nft flush ruleset
+    nft -s list ruleset > /etc/nftables.conf
+    echo "All services and firewall disabled. Flushed rules have been persisted."
 }
+
 help(){
-  cat <<MSG
+    cat <<MSG
 Usage: raycontrol <command> [args]
 Services Management:
   enable         Enable all services + firewall and persist rules
   disable        Disable all services + firewall and persist flushed rules
 Xray User Management:
   list-users     List VLESS/Trojan users
-  add-user [vless|trojan] Add a new VLESS or Trojan user
-  del-user <ID>  Delete a user from the local DB (manual xray config edit required)
+  add-user [vless|trojan]  Add a new VLESS or Trojan user
+  del-user <ID>  Delete a user (automatically updates config.json)
 IP Whitelist Management:
   list-ips       List whitelisted IPs and their remaining timeout
   add-ip <IP>    Whitelist an IP
@@ -278,7 +336,9 @@ IP Whitelist Management:
   check-conns <IP> Check active connections for a specific IP
 MSG
 }
+
 ensure_db
+
 case "${1:-help}" in
   help)        help ;;
   enable)      enable_all ;;
