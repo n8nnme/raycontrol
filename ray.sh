@@ -218,24 +218,26 @@ chown nobody:nogroup "$HYSTERIA_DB_CONF"
 chmod 600 "$HYSTERIA_DB_CONF"
 
 systemctl enable --now postgresql
-sudo -u postgres psql -c "CREATE DATABASE $PG_DB_NAME;"
-sudo -u postgres psql -c "CREATE USER $PG_USER WITH PASSWORD '$PG_PASSWORD';"
-sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $PG_DB_NAME TO $PG_USER;"
 
+sudo -i -u postgres bash <<'EOF'
+psql -c "CREATE DATABASE $PG_DB_NAME;"
+psql -c "CREATE USER $PG_USER WITH PASSWORD '$PG_PASSWORD';"
+psql -c "GRANT ALL PRIVILEGES ON DATABASE $PG_DB_NAME TO $PG_USER;"
 export PGPASSWORD=$PG_PASSWORD
 psql -h localhost -U "$PG_USER" -d "$PG_DB_NAME" -c "
   CREATE TABLE xray_users (
     id SERIAL PRIMARY KEY,
-    type VARCHAR(10) NOT NULL CHECK (type IN ('vless', 'trojan')),
+    type VARCHAR(10) NOT NULL CHECK (type IN ('vless','trojan')),
     user_id VARCHAR(255) UNIQUE NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
   );
   CREATE TABLE hysteria_users (
     id SERIAL PRIMARY KEY,
     password VARCHAR(255) UNIQUE NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
   );
 "
+EOF
 unset PGPASSWORD
 log_info "PostgreSQL user '$PG_USER' and database '$PG_DB_NAME' created."
 log_info "PostgreSQL is configured for local network connections only by default via pg_hba.conf."
@@ -285,11 +287,9 @@ log_info "DNS validation successful!"
 
 log_info "--- Storing Initial Users in PostgreSQL ---"
 export PGPASSWORD=$PG_PASSWORD
-sudo -i -u postgres bash <<'EOF'
 psql -h localhost -U "$PG_USER" -d "$PG_DB_NAME" -c "INSERT INTO xray_users (type, user_id) VALUES ('vless', '$UUID_VLESS');"
 psql -h localhost -U "$PG_USER" -d "$PG_DB_NAME" -c "INSERT INTO xray_users (type, user_id) VALUES ('trojan', '$PASSWORD_TROJAN');"
 psql -h localhost -U "$PG_USER" -d "$PG_DB_NAME" -c "INSERT INTO hysteria_users (password) VALUES ('$PASSWORD_HYSTERIA');"
-EOF
 unset PGPASSWORD
 log_info "Initial VLESS, Trojan, and Hysteria users saved to the database."
 
