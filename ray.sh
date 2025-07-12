@@ -221,9 +221,11 @@ systemctl enable --now postgresql
 
 ORIG_DIR="$PWD"
 cd /tmp
-sudo -u postgres psql -c "CREATE DATABASE $PG_DB_NAME;"
-sudo -u postgres psql -c "CREATE USER $PG_USER WITH PASSWORD '$PG_PASSWORD';"
-sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $PG_DB_NAME TO $PG_USER;"
+sudo -u postgres psql -c "CREATE DATABASE \"$PG_DB_NAME\";"
+sudo -u postgres psql -c "CREATE USER \"$PG_USER\" WITH PASSWORD '$PG_PASSWORD';"
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"$PG_DB_NAME\" TO \"$PG_USER\";"
+sudo -u postgres psql -d "$PG_DB_NAME" -c \
+  "GRANT USAGE, CREATE ON SCHEMA public TO \"$PG_USER\";"
 cd "$ORIG_DIR"
 export PGPASSWORD=$PG_PASSWORD
 psql -h localhost -U "$PG_USER" -d "$PG_DB_NAME" -c "
@@ -649,6 +651,8 @@ restore_config() {
   sudo -u postgres psql -c "DROP DATABASE IF EXISTS \"$PG_DB_NAME\";"
   sudo -u postgres psql -c "CREATE DATABASE \"$PG_DB_NAME\";"
   sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"$PG_DB_NAME\" TO \"$PG_USER\";"
+  sudo -u postgres psql -d "$PG_DB_NAME" -c \
+  "GRANT USAGE, CREATE ON SCHEMA public TO \"$PG_USER\";"
   psql -h "$PG_HOST" -U "$PG_USER" -d "$PG_DB_NAME" < "$temp_dir/ray_aio_db.sql"
   regenerate_configs
   rm -rf "$temp_dir"
