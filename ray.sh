@@ -7,7 +7,7 @@ VERBOSE_FLAG=""
 if [[ "${1:-}" == "--debug" || "${1:-}" == "--verbose" ]]; then
     DEBUG=true
     VERBOSE_FLAG=$1
-    set -x # Enable expanded output for troubleshooting
+    set -x
 fi
 
 # --- Configuration: Paths ---
@@ -20,16 +20,17 @@ APPLY_NFTABLES_SCRIPT="/usr/local/bin/apply_nftables_xray.sh"
 XRAY_DIR="/etc/xray"
 XRAY_LOG_DIR="/var/log/xray"
 XRAY_CONFIG="$XRAY_DIR/config.json"
-XRAY_USERS_DB="$XRAY_DIR/users.db"
+XRAY_CONFIG_TPL="$XRAY_DIR/config.json.tpl"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_SERVICE="/etc/systemd/system/xray.service"
 HYSTERIA_DIR="/etc/hysteria"
 HYSTERIA_CONFIG="$HYSTERIA_DIR/config.yaml"
-HYSTERIA_USERS_DB="$HYSTERIA_DIR/users.db"
+HYSTERIA_USERS_DB_FILE="$HYSTERIA_DIR/users.db"
 HYSTERIA_BIN="/usr/local/bin/hysteria-server"
 HYSTERIA_SERVICE="/etc/systemd/system/hysteria-server.service"
 SECRETS_DIR="/root/.secrets"
 CLOUDFLARE_INI="$SECRETS_DIR/cloudflare.ini"
+DB_CONF="$SECRETS_DIR/db.conf"
 LE_POST_HOOK_DIR="/etc/letsencrypt/renewal-hooks/post"
 LE_POST_HOOK_SCRIPT="$LE_POST_HOOK_DIR/reload_services.sh"
 TEMP_ZIP="/tmp/Xray-linux-64.zip"
@@ -43,23 +44,14 @@ NC='\033[0m'
 
 # --- Logging Functions ---
 log_msg() {
-    local level_color="$1"
-    local level_text="$2"
-    local message="$3"
-    local timestamp
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local level_color="$1"; local level_text="$2"; local message="$3"
+    local timestamp; timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     echo "[$timestamp] [$level_text] $message" | tee -a "$LOG_FILE" > /dev/null
     echo -e "${level_color}[$timestamp] [$level_text] ${message}${NC}"
 }
-log_info() {
-    log_msg "$GREEN" "INFO" "$1"
-}
-log_warn() {
-    log_msg "$YELLOW" "WARN" "$1"
-}
-log_error() {
-    log_msg "$RED" "ERROR" "$1" >&2
-}
+log_info() { log_msg "$GREEN" "INFO" "$1"; }
+log_warn() { log_msg "$YELLOW" "WARN" "$1"; }
+log_error() { log_msg "$RED" "ERROR" "$1" >&2; }
 
 touch "$LOG_FILE"
 chmod 644 "$LOG_FILE"
@@ -75,20 +67,32 @@ cleanup() {
         nft flush ruleset
     fi
 
-    if command -v xray &> /dev/null; then
+    if command -v xray &>/dev/null; then
         systemctl disable --now xray &>/dev/null
-        rm -f "$XRAY_BIN" "$XRAY_SERVICE"
+        rm -f "$XRAY_BIN" "$XRAY_SERVICE" "$XRAY_CONFIG_TPL"
     fi
 
-    if command -v hysteria-server &> /dev/null; then
+    if command -v hysteria-server &>/dev/null; then
         systemctl disable --now hysteria-server &>/dev/null
         rm -f "$HYSTERIA_BIN" "$HYSTERIA_SERVICE"
+    fi
+
+    if command -v psql &>/dev/null && [ -f "$DB_CONF" ]; then
+        log_warn "Dropping PostgreSQL database and user..."
+        PG_DB_USER=$(grep "PG_USER" "$DB_CONF" | cut -d'=' -f2 | tr -d '"')
+        PG_DB_NAME=$(grep "PG_DB_NAME" "$DB_CONF" | cut -d'=' -f2 | tr -d '"')
+        if [[ -n "$PG_DB_NAME" && -n "$PG_DB_USER" ]]; then
+           sudo -u postgres psql -c "DROP DATABASE IF EXISTS $PG_DB_NAME;" &>/dev/null
+           sudo -u postgres psql -c "DROP USER IF EXISTS $PG_DB_USER;" &>/dev/null
+        fi
+        log_warn "Purging PostgreSQL packages..."
+        apt-get purge -y --auto-remove postgresql*
     fi
 
     systemctl daemon-reload
 
     log_warn "Removing configuration directories..."
-    rm -rf "$RAY_AIO_DIR" "$XRAY_DIR" "$HYSTERIA_DIR" "$SECRETS_DIR"
+    rm -rf "$RAY_AIO_DIR" "$XRAY_DIR" "$HYSTERIA_DIR" "$SECRETS_DIR" "$LE_POST_HOOK_DIR"
 
     if [[ -n "${XANMOD_PKG_NAME_INSTALLED:-}" ]]; then
         log_warn "Uninstalling XanMod Kernel package: ${XANMOD_PKG_NAME_INSTALLED}"
@@ -96,29 +100,24 @@ cleanup() {
     fi
 
     log_warn "Removing temporary files..."
-    rm -f "$TEMP_AWK" "$TEMP_ZIP"
+    rm -f "$TEMP_AWK" "$TEMP_ZIP" "$RAYCONTROL_PATH"
 
     log_warn "Rollback complete. The system should be in its original state."
     exit 1
 }
 
 validate_port() {
-    local port_val="$1"
-    local port_name="$2"
-    local min_val="${3:-1}"
+    local port_val="$1"; local port_name="$2"; local min_val="${3:-1}"
     if ! [[ "$port_val" =~ ^[1-9][0-9]*$ ]]; then
-        log_error "Port '$port_name' ($port_val) is not a valid number."
-        exit 1
+        log_error "Port '$port_name' ($port_val) is not a valid number."; exit 1
     fi
     if (( port_val < min_val || port_val > 65535 )); then
-        log_error "Port '$port_name' ($port_val) must be between $min_val and 65535."
-        exit 1
+        log_error "Port '$port_name' ($port_val) must be between $min_val and 65535."; exit 1
     fi
 }
 
 if [[ $EUID -ne 0 ]]; then
-  log_error "This script must be run as root."
-  exit 1
+  log_error "This script must be run as root."; exit 1
 fi
 
 read -rp "Domain (e.g. your.domain.com): " DOMAIN
@@ -126,37 +125,24 @@ read -rp "Cloudflare API Token: " CF_API_TOKEN
 read -rp "Let’s Encrypt email: " EMAIL
 
 log_info "--- Verifying Cloudflare API Token ---"
-CF_ZONE_ID_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN" \
-  -H "Authorization: Bearer $CF_API_TOKEN" \
-  -H "Content-Type: application/json")
-
+CF_ZONE_ID_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json")
 if ! echo "$CF_ZONE_ID_RESPONSE" | jq -e '.success' &>/dev/null; then
     ERROR_MSG=$(echo "$CF_ZONE_ID_RESPONSE" | jq -r '.errors[0].message' 2>/dev/null || echo "Unknown error")
-    log_error "Cloudflare API token is invalid or lacks 'Zone.Read' permissions."
-    log_error "API response: $ERROR_MSG"
-    exit 1
+    log_error "Cloudflare API token is invalid or lacks 'Zone.Read' permissions. API response: $ERROR_MSG"; exit 1
 fi
 log_info "Cloudflare API Token appears to be valid."
 
 echo
 log_warn "Specify three distinct TCP ports for Port Knocking (e.g. 10001 10002 10003):"
 read -rp "Knock ports: " K1 K2 K3
+read -rp "Port for VLESS/XTLS (TCP, 200–65535, default 443): " PORT_VLESS; PORT_VLESS=${PORT_VLESS:-443}
+read -rp "Port for Trojan (TCP, 200–65535, default 8443): " PORT_TROJAN; PORT_TROJAN=${PORT_TROJAN:-8443}
+read -rp "Port for Hysteria2 (UDP, 200-65535, default 3478): " PORT_HYSTERIA; PORT_HYSTERIA=${PORT_HYSTERIA:-3478}
 
-read -rp "Port for VLESS/XTLS (TCP, 200–65535, default 443): " PORT_VLESS
-PORT_VLESS=${PORT_VLESS:-443}
-read -rp "Port for Trojan (TCP, 200–65535, default 8443): " PORT_TROJAN
-PORT_TROJAN=${PORT_TROJAN:-8443}
-read -rp "Port for Hysteria2 (UDP, 200-65535, default 3478): " PORT_HYSTERIA
-PORT_HYSTERIA=${PORT_HYSTERIA:-3478}
-
-validate_port "$K1" "K1"
-validate_port "$K2" "K2"
-validate_port "$K3" "K3"
+validate_port "$K1" "K1"; validate_port "$K2" "K2"; validate_port "$K3" "K3"
 if [[ "$K1" == "$K2" || "$K2" == "$K3" || "$K1" == "$K3" ]]; then
-  log_error "Knock ports must be three distinct numbers."
-  exit 1
+  log_error "Knock ports must be three distinct numbers."; exit 1
 fi
-
 validate_port "$PORT_VLESS" "PORT_VLESS" 200
 validate_port "$PORT_TROJAN" "PORT_TROJAN" 200
 validate_port "$PORT_HYSTERIA" "PORT_HYSTERIA" 200
@@ -167,19 +153,12 @@ read -rp "Install XanMod kernel for BBRv3 and other optimizations? [y/N]: " INST
 log_info "--- Pre-flight Checks ---"
 SSH_PORT=$(ss -tnlp | awk '/sshd/ && /LISTEN/ { sub(".*:", "", $4); print $4; exit }')
 log_info "Detected SSH port: $SSH_PORT"
-
 for P_VAR in PORT_VLESS PORT_TROJAN; do
     VAL=${!P_VAR}
-    if ss -tlpn | grep -q ":$VAL\s"; then
-        log_error "TCP Port $VAL is already in use."
-        exit 1
-    fi
+    if ss -tlpn | grep -q ":$VAL\s"; then log_error "TCP Port $VAL is already in use."; exit 1; fi
     log_info "TCP Port $VAL is available."
 done
-if ss -ulpn | grep -q ":$PORT_HYSTERIA\s"; then
-    log_error "UDP Port $PORT_HYSTERIA is already in use."
-    exit 1
-fi
+if ss -ulpn | grep -q ":$PORT_HYSTERIA\s"; then log_error "UDP Port $PORT_HYSTERIA is already in use."; exit 1; fi
 log_info "UDP Port $PORT_HYSTERIA is available."
 
 echo
@@ -189,28 +168,17 @@ echo "VLESS Port (TCP):   $PORT_VLESS"
 echo "Trojan Port (TCP):  $PORT_TROJAN"
 echo "Hysteria2 Port (UDP):$PORT_HYSTERIA"
 echo "Knock Ports:        $K1, $K2, $K3"
-if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
-    echo "Install XanMod:     Yes"
-fi
+if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then echo "Install XanMod:     Yes"; fi
 echo -e "${YELLOW}----------------------------${NC}\n"
 
 read -rp "Proceed with installation? [y/N]: " CONFIRM
-if [[ "${CONFIRM,,}" != "y" ]]; then
-    echo "Installation cancelled."
-    trap - ERR EXIT
-    exit 1
-fi
+if [[ "${CONFIRM,,}" != "y" ]]; then echo "Installation cancelled."; trap - ERR EXIT; exit 1; fi
 
 log_info "--- Installing Core Dependencies ---"
 apt-get update
-apt-get install -y \
-  curl wget unzip jq nftables certbot qrencode \
-  python3-certbot-dns-cloudflare \
-  uuid-runtime openssl socat gawk \
-  dnsutils uuid uuid-dev uuid-runtime uuidcdef ssl-cert conntrack \
-  bc coreutils watch
+apt-get install -y curl wget unzip jq nftables certbot qrencode python3-certbot-dns-cloudflare uuid-runtime openssl socat gawk dnsutils bc coreutils watch postgresql postgresql-client
 
-mkdir -p "$RAY_AIO_DIR" "/var/backups/ray-aio"
+mkdir -p "$RAY_AIO_DIR" "/var/backups/ray-aio" "$SECRETS_DIR"
 
 cat > "$INSTALL_CONF" <<EOF
 DOMAIN="$DOMAIN"
@@ -232,13 +200,48 @@ EOF
 VLESS_FLOW=$(jq -r '.vless_flow' "$SETTINGS_FILE")
 XRAY_ALPN=$(jq -c '.alpn' "$SETTINGS_FILE")
 
+log_info "--- Setting up PostgreSQL Database ---"
+PG_USER="ray_aio_user"
+PG_DB_NAME="ray_aio_db"
+PG_PASSWORD=$(head -c32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9')
+cat > "$DB_CONF" <<EOF
+PG_HOST="localhost"
+PG_PORT="5432"
+PG_USER="$PG_USER"
+PG_DB_NAME="$PG_DB_NAME"
+PG_PASSWORD="$PG_PASSWORD"
+EOF
+chmod 600 "$DB_CONF"
+
+systemctl enable --now postgresql
+sudo -u postgres psql -c "CREATE DATABASE $PG_DB_NAME;"
+sudo -u postgres psql -c "CREATE USER $PG_USER WITH PASSWORD '$PG_PASSWORD';"
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $PG_DB_NAME TO $PG_USER;"
+
+export PGPASSWORD=$PG_PASSWORD
+psql -h localhost -U "$PG_USER" -d "$PG_DB_NAME" -c "
+  CREATE TABLE xray_users (
+    id SERIAL PRIMARY KEY,
+    type VARCHAR(10) NOT NULL CHECK (type IN ('vless', 'trojan')),
+    user_id VARCHAR(255) UNIQUE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE hysteria_users (
+    id SERIAL PRIMARY KEY,
+    password VARCHAR(255) UNIQUE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+  );
+"
+unset PGPASSWORD
+log_info "PostgreSQL user '$PG_USER' and database '$PG_DB_NAME' created."
+log_info "PostgreSQL is configured for local network connections only by default via pg_hba.conf."
+
 if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
     log_info "--- Setting up XanMod Repository ---"
     apt-get install -y gpg
     echo 'deb http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-kernel.list
     wget -qO - https://dl.xanmod.org/gpg.key | gpg --dearmor -o /etc/apt/trusted.gpg.d/xanmod-kernel.gpg
-    log_info "--- Updating sources for XanMod ---"
-    apt-get update
+    log_info "--- Updating sources for XanMod ---"; apt-get update
     log_info "--- Checking CPU microarchitecture level ---"
     cat > "$TEMP_AWK" <<'AWK'
 #!/usr/bin/awk -f
@@ -252,11 +255,8 @@ BEGIN {
     exit 1
 }
 AWK
-    chmod +x "$TEMP_AWK"
-    XANMOD_PKG_NAME="linux-xanmod-lts-x64v1"
-    CPU_LEVEL_EXIT_CODE=0
-    "$TEMP_AWK" || CPU_LEVEL_EXIT_CODE=$?
-    rm -f "$TEMP_AWK"
+    chmod +x "$TEMP_AWK"; XANMOD_PKG_NAME="linux-xanmod-lts-x64v1"; CPU_LEVEL_EXIT_CODE=0
+    "$TEMP_AWK" || CPU_LEVEL_EXIT_CODE=$?; rm -f "$TEMP_AWK"
     case $CPU_LEVEL_EXIT_CODE in
         3) XANMOD_PKG_NAME="linux-xanmod-x64v2" ;;
         4) XANMOD_PKG_NAME="linux-xanmod-x64v3" ;;
@@ -264,103 +264,72 @@ AWK
         *) XANMOD_PKG_NAME="linux-xanmod-lts-x64v1" ;;
     esac
     log_info "--- Installing XanMod Kernel ($XANMOD_PKG_NAME) ---"
-    apt-get install -y "$XANMOD_PKG_NAME"
-    XANMOD_PKG_NAME_INSTALLED=$XANMOD_PKG_NAME
+    apt-get install -y "$XANMOD_PKG_NAME"; XANMOD_PKG_NAME_INSTALLED=$XANMOD_PKG_NAME
 fi
 
-UUID_VLESS=$(uuidgen)
-PASSWORD_TROJAN=$(head -c16 /dev/urandom | base64 | tr '+/' '_-' | cut -c1-16)
-PASSWORD_HYSTERIA=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
-PASSWORD_HYSTERIA_OBFS=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
+UUID_VLESS=$(uuidgen); PASSWORD_TROJAN=$(head -c16 /dev/urandom | base64 | tr '+/' '_-' | cut -c1-16)
+PASSWORD_HYSTERIA=$(head -c32 /dev/urandom | base64 | tr '+/' '_-'); PASSWORD_HYSTERIA_OBFS=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
 
 log_info "--- Validating DNS Records ---"
-SERVER_IP=$(curl -s https://ipwho.de/ip)
-if [[ -z "$SERVER_IP" ]]; then
-    log_error "Could not determine server's public IP address."
-    exit 1
-fi
-log_info "This server's public IP is: $SERVER_IP"
-log_warn "Please ensure you have an A record for $DOMAIN pointing to this IP in your Cloudflare DNS."
-log_warn "Waiting 60 seconds for DNS to propagate..."
-for i in {60..1}; do printf "\rWaiting... %2d" "$i"; sleep 1; done
-echo -e "\rDone waiting. Now checking DNS resolution."
-
-RESOLVED_IP=$(dig +short "$DOMAIN" @1.1.1.1 || echo "")
-log_info "Resolved IP for $DOMAIN is: ${RESOLVED_IP:-Not found}"
-if [[ "$RESOLVED_IP" != "$SERVER_IP" ]]; then
-    log_error "DNS validation failed!"
-    log_error "The domain $DOMAIN does not resolve to this server's IP ($SERVER_IP)."
-    log_error "Please update your DNS A record in Cloudflare and run the script again."
-    exit 1
-fi
+SERVER_IP=$(curl -s https://ipwho.de/ip); if [[ -z "$SERVER_IP" ]]; then log_error "Could not determine server's public IP address."; exit 1; fi
+log_info "This server's public IP is: $SERVER_IP"; log_warn "Please ensure you have an A record for $DOMAIN pointing to this IP in your Cloudflare DNS."
+log_warn "Waiting 60 seconds for DNS to propagate..."; for i in {60..1}; do printf "\rWaiting... %2d" "$i"; sleep 1; done; echo -e "\rDone waiting. Now checking DNS resolution."
+RESOLVED_IP=$(dig +short "$DOMAIN" @1.1.1.1 || echo ""); log_info "Resolved IP for $DOMAIN is: ${RESOLVED_IP:-Not found}"
+if [[ "$RESOLVED_IP" != "$SERVER_IP" ]]; then log_error "DNS validation failed! The domain $DOMAIN does not resolve to this server's IP ($SERVER_IP)."; exit 1; fi
 log_info "DNS validation successful!"
+
+log_info "--- Storing Initial Users in PostgreSQL ---"
+export PGPASSWORD=$PG_PASSWORD
+psql -h localhost -U "$PG_USER" -d "$PG_DB_NAME" -c "INSERT INTO xray_users (type, user_id) VALUES ('vless', '$UUID_VLESS');"
+psql -h localhost -U "$PG_USER" -d "$PG_DB_NAME" -c "INSERT INTO xray_users (type, user_id) VALUES ('trojan', '$PASSWORD_TROJAN');"
+psql -h localhost -U "$PG_USER" -d "$PG_DB_NAME" -c "INSERT INTO hysteria_users (password) VALUES ('$PASSWORD_HYSTERIA');"
+unset PGPASSWORD
+log_info "Initial VLESS, Trojan, and Hysteria users saved to the database."
 
 cat > "$RAYCONTROL_PATH" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-DEBUG=false
-VERBOSE_FLAG=""
+DEBUG=false; VERBOSE_FLAG=""
 if [[ "${1:-}" == "--debug" || "${1:-}" == "--verbose" ]]; then
-    DEBUG=true
-    VERBOSE_FLAG=$1
-    set -x
-    shift
+    DEBUG=true; VERBOSE_FLAG=$1; set -x; shift
 fi
 
-LOG_FILE="/var/log/raycontrol.log"
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
+# --- Config Paths ---
+RAY_AIO_DIR="/etc/ray-aio"; SECRETS_DIR="/root/.secrets"; DB_CONF="$SECRETS_DIR/db.conf"
+XRAY_DIR="/etc/xray"; XCONF="${XRAY_DIR}/config.json"; XCONF_TPL="${XRAY_DIR}/config.json.tpl"
+HYSTERIA_DIR="/etc/hysteria"; HYSTERIA_CONF="${HYSTERIA_DIR}/config.yaml"; HYSTERIA_USERS_DB_FILE="${HYSTERIA_DIR}/users.db"
+BACKUP_DIR="/var/backups/ray-aio"; INSTALL_CONF="${RAY_AIO_DIR}/install.conf"
+SETTINGS_FILE="${RAY_AIO_DIR}/settings.json"; LOG_FILE="/var/log/raycontrol.log"
+ENABLED_FLAG="${XRAY_DIR}/enabled.flag"; NFT_TABLE="inet filter"; NFT_SET="xray_clients"
 
+# --- Colors ---
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
+
+# --- Logging ---
 log_msg() {
-    local level_color="$1"
-    local level_text="$2"
-    local message="$3"
-    local timestamp
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local level_color="$1"; local level_text="$2"; local message="$3"
+    local timestamp; timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     echo "[$timestamp] [$level_text] $message" >> "$LOG_FILE"
     echo -e "${level_color}[$timestamp] [$level_text] ${message}${NC}"
 }
-log_info() {
-    log_msg "$GREEN" "INFO" "$1"
-}
-log_warn() {
-    log_msg "$YELLOW" "WARN" "$1"
-}
-log_error() {
-    log_msg "$RED" "ERROR" "$1" >&2
-}
+log_info() { log_msg "$GREEN" "INFO" "$1"; }; log_warn() { log_msg "$YELLOW" "WARN" "$1"; }; log_error() { log_msg "$RED" "ERROR" "$1" >&2; }
 
-XRAY_DIR="/etc/xray"
-HYSTERIA_DIR="/etc/hysteria"
-RAY_AIO_DIR="/etc/ray-aio"
-BACKUP_DIR="/var/backups/ray-aio"
-XCONF="${XRAY_DIR}/config.json"
-HYSTERIA_CONF="${HYSTERIA_DIR}/config.yaml"
-DB_XRAY_USERS="${XRAY_DIR}/users.db"
-DB_HY_USERS="${HYSTERIA_DIR}/users.db"
-DB_IPS="${XRAY_DIR}/ips.db"
-ENABLED_FLAG="${XRAY_DIR}/enabled.flag"
-INSTALL_CONF="${RAY_AIO_DIR}/install.conf"
-SETTINGS_FILE="${RAY_AIO_DIR}/settings.json"
-NFT_TABLE="inet filter"
-NFT_SET="xray_clients"
+# --- DB Connection ---
+if [ ! -f "$DB_CONF" ]; then log_error "Database configuration not found at $DB_CONF"; exit 1; fi
+source "$DB_CONF"; export PGPASSWORD=$PG_PASSWORD
+PSQL_CMD="psql -h $PG_HOST -U $PG_USER -d $PG_DB_NAME -qtAX"
 
-ensure_db(){
-    mkdir -p "$XRAY_DIR" "$HYSTERIA_DIR" "$BACKUP_DIR"
-    touch "$DB_XRAY_USERS" "$DB_HY_USERS" "$DB_IPS"
-    chmod 600 "$DB_XRAY_USERS" "$DB_HY_USERS" "$DB_IPS"
-    chown nobody:nogroup "$DB_XRAY_USERS" "$DB_HY_USERS" "$DB_IPS"
-    if [ ! -f "$ENABLED_FLAG" ]; then
-        echo "disabled" > "$ENABLED_FLAG"
+# --- Helper Functions ---
+check_db_connection() {
+    if ! $PSQL_CMD -c "SELECT 1" &>/dev/null; then
+        log_error "Failed to connect to PostgreSQL database '$PG_DB_NAME' as user '$PG_USER'."; exit 1
     fi
 }
 
 reload_services(){
-    if [[ "$(cat "$ENABLED_FLAG")" == "enabled" ]]; then
-        case "$1" in
+    if [[ -f "$ENABLED_FLAG" && "$(cat "$ENABLED_FLAG")" == "enabled" ]]; then
+        case "${1:-all}" in
             xray) systemctl restart xray; log_info "Xray service reloaded." ;;
             hysteria) systemctl restart hysteria-server; log_info "Hysteria2 service reloaded." ;;
             *) systemctl restart xray; systemctl restart hysteria-server; log_info "All services reloaded." ;;
@@ -368,201 +337,151 @@ reload_services(){
     fi
 }
 
+regenerate_configs() {
+    log_info "Regenerating service configurations from PostgreSQL database..."
+    local vless_flow; vless_flow=$(jq -r '.vless_flow' "$SETTINGS_FILE")
+    local xray_config; xray_config=$(cat "$XCONF_TPL")
+    local vless_clients_json; vless_clients_json=$($PSQL_CMD -c "SELECT json_agg(json_build_object('id', user_id, 'flow', '$vless_flow')) FROM xray_users WHERE type = 'vless';")
+    local trojan_clients_json; trojan_clients_json=$($PSQL_CMD -c "SELECT json_agg(json_build_object('password', user_id)) FROM xray_users WHERE type = 'trojan';")
+    xray_config=$(echo "$xray_config" | jq --argjson clients "${vless_clients_json:-[]}" '.inbounds[0].settings.clients = $clients')
+    xray_config=$(echo "$xray_config" | jq --argjson clients "${trojan_clients_json:-[]}" '.inbounds[1].settings.clients = $clients')
+    echo "$xray_config" > "$XCONF"
+    log_info "Xray config.json regenerated."
+    $PSQL_CMD -c "SELECT password FROM hysteria_users;" > "$HYSTERIA_USERS_DB_FILE"
+    log_info "Hysteria users file regenerated."
+}
+
 show_qr() {
-    local type="$1"
-    local id="$2"
-
-    if ! command -v qrencode &> /dev/null; then
-        log_error "Error: 'qrencode' is not installed. Please run 'apt install qrencode'."
-        return 1
-    fi
-    if [ ! -f "$INSTALL_CONF" ] || [ ! -f "$SETTINGS_FILE" ]; then
-        log_error "Core config files not found in $RAY_AIO_DIR"
-        exit 1;
-    fi
+    local type="$1"; local id="$2"
+    if ! command -v qrencode &> /dev/null; then log_error "Error: 'qrencode' is not installed."; return 1; fi
+    if [ ! -f "$INSTALL_CONF" ] || [ ! -f "$SETTINGS_FILE" ]; then log_error "Core config files not found"; exit 1; fi
     source "$INSTALL_CONF"
-    local vless_flow
-    vless_flow=$(jq -r '.vless_flow' "$SETTINGS_FILE")
-    local alpn
-    alpn=$(jq -r '.alpn[0]' "$SETTINGS_FILE")
-
-    local uri=""
-    local name=""
-
+    local vless_flow; vless_flow=$(jq -r '.vless_flow' "$SETTINGS_FILE")
+    local alpn; alpn=$(jq -r '.alpn[0]' "$SETTINGS_FILE")
+    local uri=""; local name=""
     case "$type" in
-        vless)
-            name="${DOMAIN}-VLESS-${id:0:8}"
-            uri="vless://${id}@${DOMAIN}:${PORT_VLESS}?type=tcp&security=xtls&flow=${vless_flow}&alpn=${alpn}&sni=${DOMAIN}#${name}"
-            ;;
-        trojan)
-            name="${DOMAIN}-Trojan-${id:0:8}"
-            uri="trojan://${id}@${DOMAIN}:${PORT_TROJAN}?alpn=${alpn}&sni=${DOMAIN}#${name}"
-            ;;
+        vless) name="${DOMAIN}-VLESS-${id:0:8}"; uri="vless://${id}@${DOMAIN}:${PORT_VLESS}?type=tcp&security=xtls&flow=${vless_flow}&alpn=${alpn}&sni=${DOMAIN}#${name}" ;;
+        trojan) name="${DOMAIN}-Trojan-${id:0:8}"; uri="trojan://${id}@${DOMAIN}:${PORT_TROJAN}?alpn=${alpn}&sni=${DOMAIN}#${name}" ;;
         hysteria)
-            if [[ -z "$id" ]]; then
-                log_error "Please provide a Hysteria password to generate a QR code."
-                exit 1;
-            fi
-            local obfs_pass
-            obfs_pass=$(awk '/salamander:/,/password:/ {if ($1 == "password:") {print $2; exit}}' "$HYSTERIA_CONF")
-            if [[ -z "$obfs_pass" ]]; then
-                log_error "Could not read Hysteria OBFS password from $HYSTERIA_CONF"
-                exit 1;
-            fi
-            name="${DOMAIN}-Hysteria2-${id:0:6}"
-            uri="hysteria2://${id}@${DOMAIN}:${PORT_HYSTERIA}?sni=${DOMAIN}&obfs=salamander&obfs-password=${obfs_pass}#${name}"
+            if [[ -z "$id" ]]; then log_error "Please provide a Hysteria password."; exit 1; fi
+            local obfs_pass; obfs_pass=$(awk '/salamander:/,/password:/ {if ($1 == "password:") {print $2; exit}}' "$HYSTERIA_CONF")
+            if [[ -z "$obfs_pass" ]]; then log_error "Could not read Hysteria OBFS password"; exit 1; fi
+            name="${DOMAIN}-Hysteria2-${id:0:6}"; uri="hysteria2://${id}@${DOMAIN}:${PORT_HYSTERIA}?sni=${DOMAIN}&obfs=salamander&obfs-password=${obfs_pass}#${name}"
             ;;
-        *)
-            log_error "Invalid type specified for QR code generation."
-            return 1;;
+        *) log_error "Invalid type specified for QR code generation."; return 1;;
     esac
-
     log_warn "--- QR Code for: $name ---"
-    qrencode -t ANSIUTF8 "$uri"
-    echo -e "${YELLOW}URI: ${uri}${NC}\n"
+    qrencode -t ANSIUTF8 "$uri"; echo -e "${YELLOW}URI: ${uri}${NC}\n"
 }
 
 add_user(){
-    local type="$1"
-    local vless_flow
-    vless_flow=$(jq -r '.vless_flow' "$SETTINGS_FILE")
-    if [[ "$type" == "vless" ]]; then
-        local uuid
-        uuid=$(uuidgen)
-        jq --arg id "$uuid" --arg flow "$vless_flow" \
-           '.inbounds[0].settings.clients += [{"id":$id,"flow":$flow}]' \
-           "$XCONF" > "$XCONF.tmp" && mv "$XCONF.tmp" "$XCONF"
-        echo "vless:$uuid" >> "$DB_XRAY_USERS"
-        log_info "Added VLESS user: $uuid"
-        reload_services xray
-        show_qr vless "$uuid"
-    elif [[ "$type" == "trojan" ]]; then
-        local pass
-        pass=$(head -c16 /dev/urandom | base64 | tr '+/' '_-' | cut -c1-16)
-        jq --arg pw "$pass" \
-           '.inbounds[1].settings.clients += [{"password":$pw}]' \
-           "$XCONF" > "$XCONF.tmp" && mv "$XCONF.tmp" "$XCONF"
-        echo "trojan:$pass" >> "$DB_XRAY_USERS"
-        log_info "Added Trojan user. Password: $pass"
-        reload_services xray
-        show_qr trojan "$pass"
-    elif [[ "$type" == "hysteria" ]]; then
-        local pass
-        pass=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
-        echo "$pass" >> "$DB_HY_USERS"
-        log_info "Added Hysteria2 user. Password: $pass"
-        reload_services hysteria
-        show_qr hysteria "$pass"
-    else
-        echo "Usage: raycontrol add-user [vless|trojan|hysteria]" >&2
-        exit 1
-    fi
+    local type="$1"; local new_id=""
+    case "$type" in
+        vless) new_id=$(uuidgen); $PSQL_CMD -c "INSERT INTO xray_users (type, user_id) VALUES ('vless', '$new_id');"; log_info "Added VLESS user to database: $new_id" ;;
+        trojan) new_id=$(head -c16 /dev/urandom | base64 | tr '+/' '_-' | cut -c1-16); $PSQL_CMD -c "INSERT INTO xray_users (type, user_id) VALUES ('trojan', '$new_id');"; log_info "Added Trojan user to database. Password: $new_id" ;;
+        hysteria) new_id=$(head -c32 /dev/urandom | base64 | tr '+/' '_-'); $PSQL_CMD -c "INSERT INTO hysteria_users (password) VALUES ('$new_id');"; log_info "Added Hysteria2 user to database. Password: $new_id" ;;
+        *) log_error "Usage: raycontrol add-user [vless|trojan|hysteria]"; exit 1 ;;
+    esac
+    regenerate_configs; reload_services; log_info "Configurations updated and services reloaded."
+    show_qr "$type" "$new_id"
 }
 
 del_user(){
-    local id="$1"
-    if grep -qE "^(vless|trojan):$id" "$DB_XRAY_USERS"; then
-        sed -i "\%^.*:$id.*%d" "$DB_XRAY_USERS"
-        jq "del(.inbounds[] | .settings.clients[]? | select(.id == \"$id\" or .password == \"$id\"))" \
-           "$XCONF" > "$XCONF.tmp" && mv "$XCONF.tmp" "$XCONF"
-        log_info "Removed Xray user: $id"
-        reload_services xray
-    elif grep -qFx "$id" "$DB_HY_USERS"; then
-        sed -i "\%^${id}\$%d" "$DB_HY_USERS"
-        log_info "Removed Hysteria2 user: $id"
-        reload_services hysteria
-    else
-        log_error "User not found: $id"
-        exit 1
-    fi
+    local id="$1"; if [ -z "$id" ]; then log_error "Please provide a user ID or password to delete."; exit 1; fi
+    local xray_deleted_count; xray_deleted_count=$($PSQL_CMD -c "DELETE FROM xray_users WHERE user_id = '$id';" | sed 's/DELETE //')
+    local hysteria_deleted_count; hysteria_deleted_count=$($PSQL_CMD -c "DELETE FROM hysteria_users WHERE password = '$id';" | sed 's/DELETE //')
+    if (( xray_deleted_count > 0 || hysteria_deleted_count > 0 )); then
+        log_info "Removed user '$id' from the database."; regenerate_configs; reload_services
+        log_info "Configurations updated and services reloaded."
+    else log_error "User not found: $id"; exit 1; fi
 }
 
 list_users(){
-    log_warn "--- Xray Users (VLESS/Trojan) ---"
-    if [[ ! -s "$DB_XRAY_USERS" ]]; then
-        echo "(none)"
-    else
-        echo "TYPE    ID/PASSWORD"
-        echo "----------------------------------------"
-        while IFS=":" read -r type id; do
-            printf "%-7s %s\n" "$type" "$id"
-        done < "$DB_XRAY_USERS"
-    fi
-
-    echo
-    log_warn "--- Hysteria2 Users ---"
-    if [[ ! -s "$DB_HY_USERS" ]]; then
-        echo "(none)"
-    else
-        echo "PASSWORD"
-        echo "--------------------------------"
-        cat "$DB_HY_USERS"
-    fi
+    log_warn "--- Xray Users (VLESS/Trojan) from PostgreSQL ---"
+    $PSQL_CMD -c "SELECT type, user_id FROM xray_users ORDER BY type, id;" | {
+        echo "TYPE    ID/PASSWORD"; echo "----------------------------------------"
+        sed 's/|/\t/' | column -t -s $'\t' || echo "(none)"
+    }
+    echo; log_warn "--- Hysteria2 Users from PostgreSQL ---"
+    $PSQL_CMD -c "SELECT password FROM hysteria_users ORDER BY id;" | {
+        echo "PASSWORD"; echo "--------------------------------"; cat || echo "(none)"
+    }
 }
 
-list_ips(){ echo "Function list_ips placeholder"; }
-check_conns(){ echo "Function check_conns placeholder"; }
-add_ip(){ echo "Function add_ip placeholder"; }
-del_ip(){ echo "Function del_ip placeholder"; }
-apply_nftables(){ echo "Function apply_nftables placeholder"; }
-enable_all(){ echo "Function enable_all placeholder"; }
-disable_all(){ echo "Function disable_all placeholder"; }
-backup_config(){ echo "Function backup_config placeholder"; }
-restore_config(){ echo "Function restore_config placeholder"; }
+backup_config() {
+    local timestamp; timestamp=$(date '+%Y%m%d-%H%M%S')
+    local backup_file="$BACKUP_DIR/ray-aio-backup-$timestamp.tar.gz"
+    local temp_dir; temp_dir=$(mktemp -d)
+    log_info "Starting backup..."
+    log_info "Backing up PostgreSQL database to $temp_dir/ray_aio_db.sql"
+    pg_dump -h $PG_HOST -U $PG_USER -d $PG_DB_NAME > "$temp_dir/ray_aio_db.sql"
+    log_info "Backing up configuration files..."
+    cp -r /etc/letsencrypt "$temp_dir/"; cp -r "$RAY_AIO_DIR" "$temp_dir/"; cp -r "$SECRETS_DIR" "$temp_dir/"
+    log_info "Creating backup archive: $backup_file"
+    tar -czf "$backup_file" -C "$temp_dir" .; rm -rf "$temp_dir"
+    log_info "Backup complete! Archive is located at $backup_file"
+}
+
+restore_config() {
+    local backup_file="$1"; if [ -z "$backup_file" ]; then log_error "Usage: raycontrol restore <path-to-backup.tar.gz>"; exit 1; fi
+    if [ ! -f "$backup_file" ]; then log_error "Backup file not found: $backup_file"; exit 1; fi
+    local temp_dir; temp_dir=$(mktemp -d)
+    log_warn "--- RESTORING FROM BACKUP ---"
+    read -rp "This will overwrite current configs and database. Are you sure? [y/N]: " confirm
+    if [[ "${confirm,,}" != "y" ]]; then log_info "Restore cancelled."; rm -rf "$temp_dir"; exit 0; fi
+    log_info "Disabling services..."; "$0" disable
+    log_info "Extracting backup file..."; tar -xzf "$backup_file" -C "$temp_dir"
+    log_info "Restoring configuration files..."
+    cp -a "$temp_dir/letsencrypt" /etc/; cp -a "$temp_dir/ray-aio" /etc/; cp -a "$temp_dir/secrets" /root/
+    log_info "Restoring PostgreSQL database..."; source "$DB_CONF"; export PGPASSWORD=$PG_PASSWORD
+    sudo -u postgres psql -c "DROP DATABASE IF EXISTS $PG_DB_NAME;"; sudo -u postgres psql -c "CREATE DATABASE $PG_DB_NAME;"
+    sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $PG_DB_NAME TO $PG_USER;"
+    psql -h $PG_HOST -U $PG_USER -d $PG_DB_NAME < "$temp_dir/ray_aio_db.sql"
+    log_info "Regenerating service configs from restored database..."; regenerate_configs
+    rm -rf "$temp_dir"; log_info "Restore complete. Run 'raycontrol enable' to restart services."
+}
+
+list_ips(){ echo "Function list_ips placeholder"; }; check_conns(){ echo "Function check_conns placeholder"; }
+add_ip(){ echo "Function add_ip placeholder"; }; del_ip(){ echo "Function del_ip placeholder"; }
+apply_nftables(){ /usr/local/bin/apply_nftables_xray.sh && nft -s list ruleset > /etc/nftables.conf; };
+enable_all(){ echo "enabled" > "$ENABLED_FLAG"; apply_nftables; reload_services all; log_info "All services and firewall enabled."; }
+disable_all(){ echo "disabled" > "$ENABLED_FLAG"; systemctl stop xray hysteria-server; nft flush ruleset; nft -s list ruleset > /etc/nftables.conf; log_info "All services and firewall disabled."; }
 show_status(){ echo "Function show_status placeholder"; }
 
-help(){
-    cat <<MSG
+help(){ cat <<MSG
 Usage: raycontrol <command> [args] [--debug|--verbose]
-
 Services Management:
   enable         Enable all services + firewall and persist rules
   disable        Disable all services + firewall and persist flushed rules
   status         Show service states, connections, and bandwidth usage
   monitor        Live monitor the status command (updates every 5s)
-
 User & QR Code Management:
-  list-users     List all users (VLESS, Trojan, Hysteria2)
+  list-users     List all users from the database
   add-user <type>  Add a new user. Type: [vless|trojan|hysteria]
-  del-user <ID>    Delete a user (VLESS UUID, Trojan pass, or Hysteria2 pass)
+  del-user <ID>    Delete a user by ID/Password
   show-qr <type> [ID]
                  Show QR code for a connection.
-                 - For Hysteria: raycontrol show-qr hysteria <PASSWORD>
-                 - For existing user: raycontrol show-qr <vless|trojan> <USER_ID>
-
 Disaster Recovery:
-  backup         Create a full backup of all configurations
+  backup         Create a full backup of all configurations and database
   restore <file> Restore configuration from a backup archive
-
-IP Whitelist Management:
+IP Whitelist & Firewall:
   list-ips       List whitelisted IPs and their remaining timeout
   add-ip <IP>    Whitelist an IP
   del-ip <IP>    Remove a whitelisted IP
-
-Troubleshooting:
-  --debug        Enable syscall tracing and expanded output.
-  --verbose      Alias for --debug.
+Configuration:
+  regenerate-configs  Force regeneration of service configs from the database
 MSG
 }
 
-ensure_db
+check_db_connection
 case "${1:-help}" in
-  help)        help ;;
-  enable)      enable_all ;;
-  disable)     disable_all ;;
-  status)      show_status ;;
-  monitor)     watch -n 5 -t --color "$0" "$VERBOSE_FLAG" status ;;
-  backup)      backup_config ;;
-  restore)     restore_config "${2:-}" ;;
-  list-users)  list_users ;;
-  add-user)    add_user "${2:-}" ;;
-  del-user)    del_user "${2:-}" ;;
-  show-qr)     show_qr "${2:-}" "${3:-}" ;;
-  list-ips)    list_ips ;;
-  add-ip)      add_ip "${2:-}" ;;
-  del-ip)      del_ip "${2:-}" ;;
-  check-conns) check_conns "${2:-}" ;;
-  *)           help ;;
+  help) help ;; enable) enable_all ;; disable) disable_all ;; status) show_status ;;
+  monitor) watch -n 5 -t --color "$0" "$VERBOSE_FLAG" status ;; backup) backup_config ;;
+  restore) restore_config "${2:-}" ;; list-users) list_users ;; add-user) add_user "${2:-}" ;;
+  del-user) del_user "${2:-}" ;; show-qr) show_qr "${2:-}" "${3:-}" ;; list-ips) list_ips ;;
+  add-ip) add_ip "${2:-}" ;; del-ip) del_ip "${2:-}" ;; check-conns) check_conns "${2:-}" ;;
+  regenerate-configs) regenerate_configs && reload_services ;;
+  *) help ;;
 esac
 EOF
 chmod +x "$RAYCONTROL_PATH"
@@ -570,13 +489,7 @@ chmod +x "$RAYCONTROL_PATH"
 cat > "$APPLY_NFTABLES_SCRIPT" <<EOF
 #!/usr/bin/env bash
 set -e
-SSH_PORT="$SSH_PORT"
-PORT_VLESS="$PORT_VLESS"
-PORT_TROJAN="$PORT_TROJAN"
-PORT_HYSTERIA="$PORT_HYSTERIA"
-K1="$K1"
-K2="$K2"
-K3="$K3"
+source /etc/ray-aio/install.conf
 nft flush ruleset
 nft add table inet filter
 nft add chain inet filter input '{ type filter hook input priority 0; policy drop; }'
@@ -587,80 +500,54 @@ nft add set inet filter knock_stage2 '{ type ipv4_addr; flags dynamic; timeout 1
 nft add set inet filter xray_clients '{ type ipv4_addr; flags dynamic; timeout 10m; }'
 nft add chain inet filter knock
 nft add rule inet filter input iif lo accept
-nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_VLESS counter update @xray_clients '{ ip saddr }' accept
-nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_TROJAN counter update @xray_clients '{ ip saddr }' accept
-nft add rule inet filter input ip saddr @xray_clients udp dport $PORT_HYSTERIA counter update @xray_clients '{ ip saddr }' accept
-nft add rule inet filter input ip saddr @xray_clients tcp dport $SSH_PORT counter update @xray_clients '{ ip saddr }' accept
+nft add rule inet filter input ip saddr @xray_clients tcp dport \$PORT_VLESS counter update @xray_clients '{ ip saddr }' accept
+nft add rule inet filter input ip saddr @xray_clients tcp dport \$PORT_TROJAN counter update @xray_clients '{ ip saddr }' accept
+nft add rule inet filter input ip saddr @xray_clients udp dport \$PORT_HYSTERIA counter update @xray_clients '{ ip saddr }' accept
+nft add rule inet filter input ip saddr @xray_clients tcp dport \$SSH_PORT counter update @xray_clients '{ ip saddr }' accept
 nft add rule inet filter input ct state established,related accept
 nft add rule inet filter input ip protocol icmp accept
 nft add rule inet filter input ip6 nexthdr ipv6-icmp accept
-nft add rule inet filter input tcp dport $K1 add @knock_stage1 '{ ip saddr }' drop
-nft add rule inet filter input tcp dport $K2 ip saddr @knock_stage1 add @knock_stage2 '{ ip saddr }' drop
-nft add rule inet filter input tcp dport $K3 ip saddr @knock_stage2 jump knock
+nft add rule inet filter input tcp dport \$K1 add @knock_stage1 '{ ip saddr }' drop
+nft add rule inet filter input tcp dport \$K2 ip saddr @knock_stage1 add @knock_stage2 '{ ip saddr }' drop
+nft add rule inet filter input tcp dport \$K3 ip saddr @knock_stage2 jump knock
 nft add rule inet filter knock add @xray_clients '{ ip saddr }'
 nft add rule inet filter knock drop
 EOF
 chmod +x "$APPLY_NFTABLES_SCRIPT"
 
 log_info "--- Issuing Certificate with Certbot ---"
-mkdir -p "$SECRETS_DIR"
-cat > "$CLOUDFLARE_INI" <<EOF
-dns_cloudflare_api_token = $CF_API_TOKEN
-EOF
-chmod 600 "$CLOUDFLARE_INI"
-certbot certonly \
-  --dns-cloudflare \
-  --dns-cloudflare-credentials "$CLOUDFLARE_INI" \
-  --agree-tos --no-eff-email \
-  -m "$EMAIL" \
-  -d "$DOMAIN"
+mkdir -p "$SECRETS_DIR"; cat > "$CLOUDFLARE_INI" <<< "dns_cloudflare_api_token = $CF_API_TOKEN"; chmod 600 "$CLOUDFLARE_INI"
+certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$CLOUDFLARE_INI" --agree-tos --no-eff-email -m "$EMAIL" -d "$DOMAIN"
 
 log_info "--- Configuring Automatic Certificate Renewal ---"
 mkdir -p "$LE_POST_HOOK_DIR"
 cat > "$LE_POST_HOOK_SCRIPT" <<'EOF'
 #!/usr/bin/env bash
-ENABLED_FLAG="/etc/xray/enabled.flag"
-if [[ -f "$ENABLED_FLAG" && "$(cat "$ENABLED_FLAG")" == "enabled" ]]; then
-    systemctl restart xray
-    systemctl restart hysteria-server
-fi
+/usr/local/bin/raycontrol regenerate-configs
+/usr/local/bin/raycontrol reload_services
 EOF
 chmod +x "$LE_POST_HOOK_SCRIPT"
 
 log_info "--- Installing Xray-core ---"
-mkdir -p "$XRAY_DIR" "$XRAY_LOG_DIR"
-chown -R nobody:nogroup "$XRAY_DIR" "$XRAY_LOG_DIR"
+mkdir -p "$XRAY_DIR" "$XRAY_LOG_DIR"; chown -R nobody:nogroup "$XRAY_DIR" "$XRAY_LOG_DIR"
 XRAY_VER=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
 wget -qO "$TEMP_ZIP" "https://github.com/XTLS/Xray-core/releases/download/$XRAY_VER/Xray-linux-64.zip"
-unzip -qo "$TEMP_ZIP" -d /usr/local/bin
-rm "$TEMP_ZIP"
-chmod +x "$XRAY_BIN"
+unzip -qo "$TEMP_ZIP" -d /usr/local/bin; rm "$TEMP_ZIP"; chmod +x "$XRAY_BIN"
 
-cat > "$XRAY_CONFIG" <<EOF
+cat > "$XRAY_CONFIG_TPL" <<EOF
 {
-  "log": {"loglevel": "warning"},
-  "inbounds": [
-    {
-      "port": $PORT_VLESS, "protocol": "vless",
-      "settings": {"clients": [{"id": "$UUID_VLESS", "flow": "$VLESS_FLOW"}], "decryption": "none"},
-      "streamSettings": {"network": "tcp", "security": "tls", "xtlsSettings": {"certificates": [{"certificateFile": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem", "keyFile": "/etc/letsencrypt/live/$DOMAIN/privkey.pem"}], "alpn": $XRAY_ALPN}}
-    },
-    {
-      "port": $PORT_TROJAN, "protocol": "trojan",
-      "settings": {"clients": [{"password": "$PASSWORD_TROJAN"}], "fallbacks": [{"dest": "@blackhole"}]},
-      "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": {"certificates": [{"certificateFile": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem", "keyFile": "/etc/letsencrypt/live/$DOMAIN/privkey.pem"}], "alpn": $XRAY_ALPN}}
-    }
-  ],
-  "outbounds": [{"protocol": "freedom"}, {"protocol": "blackhole", "tag": "@blackhole"}]
+  "log": {"loglevel": "warning"}, "inbounds": [
+    {"port": $PORT_VLESS, "protocol": "vless", "settings": {"clients": [], "decryption": "none"}, "streamSettings": {"network": "tcp", "security": "tls", "xtlsSettings": {"certificates": [{"certificateFile": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem", "keyFile": "/etc/letsencrypt/live/$DOMAIN/privkey.pem"}], "alpn": $XRAY_ALPN}}},
+    {"port": $PORT_TROJAN, "protocol": "trojan", "settings": {"clients": [], "fallbacks": [{"dest": "@blackhole"}]}, "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": {"certificates": [{"certificateFile": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem", "keyFile": "/etc/letsencrypt/live/$DOMAIN/privkey.pem"}], "alpn": $XRAY_ALPN}}}
+  ], "outbounds": [{"protocol": "freedom"}, {"protocol": "blackhole", "tag": "@blackhole"}]
 }
 EOF
-echo "vless:$UUID_VLESS" > "$XRAY_USERS_DB"
-echo "trojan:$PASSWORD_TROJAN" >> "$XRAY_USERS_DB"
 
 cat > "$XRAY_SERVICE" <<EOF
 [Unit]
 Description=Xray Service
-After=network.target nss-lookup.target
+After=network.target nss-lookup.target postgresql.service
+Requires=postgresql.service
 [Service]
 User=nobody
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
@@ -668,6 +555,7 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ExecStart=$XRAY_BIN -config $XRAY_CONFIG
 Restart=on-failure
+RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -675,33 +563,16 @@ EOF
 log_info "--- Installing Hysteria2 ---"
 RAW_TAG=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r .tag_name)
 ENC_TAG=${RAW_TAG//\//%2F}
-DOWNLOAD_URL="https://github.com/apernet/hysteria/releases/download/${ENC_TAG}/hysteria-linux-amd64"
-wget -nv -O "$HYSTERIA_BIN" "$DOWNLOAD_URL"
-chmod +x "$HYSTERIA_BIN"
-log_info "Hysteria2 installed successfully!"
+wget -nv -O "$HYSTERIA_BIN" "https://github.com/apernet/hysteria/releases/download/${ENC_TAG}/hysteria-linux-amd64"
+chmod +x "$HYSTERIA_BIN"; log_info "Hysteria2 installed successfully!"
 
-mkdir -p "$HYSTERIA_DIR"
-cat > "$HYSTERIA_CONFIG" <<EOF
+mkdir -p "$HYSTERIA_DIR"; cat > "$HYSTERIA_CONFIG" <<EOF
 listen: :$PORT_HYSTERIA
-tls:
-  cert: /etc/letsencrypt/live/$DOMAIN/fullchain.pem
-  key: /etc/letsencrypt/live/$DOMAIN/privkey.pem
-auth:
-  type: file
-  file:
-    path: $HYSTERIA_USERS_DB
-obfs:
-  type: salamander
-  salamander:
-    password: $PASSWORD_HYSTERIA_OBFS
-masquerade:
-  type: proxy
-  proxy:
-    url: https://1.1.1.1
-    rewriteHost: true
+tls: {cert: /etc/letsencrypt/live/$DOMAIN/fullchain.pem, key: /etc/letsencrypt/live/$DOMAIN/privkey.pem}
+auth: {type: file, file: {path: $HYSTERIA_USERS_DB_FILE}}
+obfs: {type: salamander, salamander: {password: $PASSWORD_HYSTERIA_OBFS}}
+masquerade: {type: proxy, proxy: {url: https://1.1.1.1, rewriteHost: true}}
 EOF
-
-echo "$PASSWORD_HYSTERIA" > "$HYSTERIA_USERS_DB"
 
 cat > "$HYSTERIA_SERVICE" <<EOF
 [Unit]
@@ -714,14 +585,16 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ExecStart=$HYSTERIA_BIN server -c $HYSTERIA_CONFIG
 Restart=on-failure
+RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
 
+log_info "--- Generating Initial Configs and Setting Permissions ---"
+"$RAYCONTROL_PATH" regenerate-configs
 usermod -aG ssl-cert nobody
-touch "$XRAY_DIR/ips.db"
-chmod 600 "$XRAY_USERS_DB" "$HYSTERIA_USERS_DB" "$XRAY_DIR/ips.db"
-chown nobody:nogroup "$XRAY_USERS_DB" "$HYSTERIA_USERS_DB" "$XRAY_DIR/ips.db"
+chown -R nobody:nogroup "$XRAY_DIR" "$HYSTERIA_DIR"
+chmod 600 "$HYSTERIA_USERS_DB_FILE"
 chgrp -R ssl-cert /etc/letsencrypt/live /etc/letsencrypt/archive
 chmod -R g+rx /etc/letsencrypt/live /etc/letsencrypt/archive
 
@@ -735,53 +608,31 @@ HYSTERIA_URI="hysteria2://${PASSWORD_HYSTERIA}@${DOMAIN}:${PORT_HYSTERIA}?sni=${
 
 trap - ERR EXIT
 log_info "--- Installation successful! ---"
-
 echo -e "\n\n${YELLOW}=====================================================${NC}"
 echo -e "${YELLOW}               ACTION REQUIRED TO ACTIVATE               ${NC}"
 echo -e "${YELLOW}=====================================================${NC}\n"
-
 if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
     echo -e "${YELLOW}IMPORTANT: A reboot is required to use the new XanMod kernel.${NC}"
     echo -e "After rebooting, run '$RAYCONTROL_PATH enable'.\n"
 else
     echo -e "Services are installed but NOT RUNNING. The firewall is NOT ACTIVE."
-    echo -e "To start all services and apply the firewall, run:\n"
-    echo -e "  ${GREEN}$RAYCONTROL_PATH enable${NC}\n"
+    echo -e "To start all services and apply the firewall, run:\n\n  ${GREEN}$RAYCONTROL_PATH enable${NC}\n"
 fi
-echo -e "After enabling, your system will be fully configured and ready."
 echo -e "Your IP will not be whitelisted automatically. You must perform the port knock first."
 echo -e "An IP will be removed from the whitelist after 10 minutes of inactivity."
-
 echo -e "\n${YELLOW}--- Initial Connection Info (once enabled) ---${NC}"
-echo "Knock sequence for all services: $K1 -> $K2 -> $K3"
-echo "SSH Port: $SSH_PORT"
-echo
-echo -e "${YELLOW}VLESS (TCP, $(jq -r '.alpn[0]' "$SETTINGS_FILE")-Only):${NC}"
-echo "  Port: $PORT_VLESS, UUID: $UUID_VLESS"
-echo
-echo -e "${YELLOW}Trojan (TCP, $(jq -r '.alpn[0]' "$SETTINGS_FILE")-Only):${NC}"
-echo "  Port: $PORT_TROJAN, Password: $PASSWORD_TROJAN"
-echo
-echo -e "${YELLOW}Hysteria2 (UDP):${NC}"
-echo "  Port: $PORT_HYSTERIA"
-echo "  Initial Auth Pass: $PASSWORD_HYSTERIA"
+echo "Knock sequence for all services: $K1 -> $K2 -> $K3"; echo "SSH Port: $SSH_PORT"; echo
+echo -e "${YELLOW}VLESS (TCP, $(jq -r '.alpn[0]' "$SETTINGS_FILE")-Only):${NC}"; echo "  Port: $PORT_VLESS, UUID: $UUID_VLESS"; echo
+echo -e "${YELLOW}Trojan (TCP, $(jq -r '.alpn[0]' "$SETTINGS_FILE")-Only):${NC}"; echo "  Port: $PORT_TROJAN, Password: $PASSWORD_TROJAN"; echo
+echo -e "${YELLOW}Hysteria2 (UDP):${NC}"; echo "  Port: $PORT_HYSTERIA"; echo "  Initial Auth Pass: $PASSWORD_HYSTERIA"
 echo "  OBFS Pass: $PASSWORD_HYSTERIA_OBFS"
-
 if command -v qrencode &> /dev/null; then
   echo -e "\n${YELLOW}--- QR Codes for Initial Users ---${NC}"
-  echo "VLESS Configuration:"
-  qrencode -t ANSIUTF8 "$VLESS_URI"
-  echo "Trojan Configuration:"
-  qrencode -t ANSIUTF8 "$TROJAN_URI"
-  echo "Hysteria2 Configuration:"
-  qrencode -t ANSIUTF8 "$HYSTERIA_URI"
+  echo "VLESS Configuration:"; qrencode -t ANSIUTF8 "$VLESS_URI"
+  echo "Trojan Configuration:"; qrencode -t ANSIUTF8 "$TROJAN_URI"
+  echo "Hysteria2 Configuration:"; qrencode -t ANSIUTF8 "$HYSTERIA_URI"
 else
-  echo -e "\n${YELLOW}--- Configuration URIs ---${NC}"
-  echo "VLESS: $VLESS_URI"
-  echo "Trojan: $TROJAN_URI"
-  echo "Hysteria2: $HYSTERIA_URI"
+  echo -e "\n${YELLOW}--- Configuration URIs ---${NC}"; echo "VLESS: $VLESS_URI"; echo "Trojan: $TROJAN_URI"; echo "Hysteria2: $HYSTERIA_URI"
 fi
-
-echo -e "\nUse ${GREEN}'$RAYCONTROL_PATH help'${NC} for a full list of commands including status, backup, and restore."
-echo -e "For more detailed output, use the ${GREEN}'--debug'${NC} or ${GREEN}'--verbose'${NC} flag with any command."
+echo -e "\nUse ${GREEN}'$RAYCONTROL_PATH help'${NC} for a full list of commands."
 echo -e "\n${GREEN}=========================================================================================${NC}\n"
