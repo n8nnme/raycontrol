@@ -381,7 +381,7 @@ show_qr() {
     local uri=""; local name=""
     case "$type" in
         vless) name="${DOMAIN}-VLESS-${id:0:8}"; uri="vless://${id}@${DOMAIN}:${PORT_VLESS}?type=tcp&security=xtls&flow=${vless_flow}&alpn=${alpn}&sni=${DOMAIN}#${name}" ;;
-        trojan) name="${DOMAIN}-Trojan-${id:0:8}"; uri="trojan://${id}@${DOMAIN}:${PORT_TROJAN}?alpn=${alpn}&sni=${DOMAIN}#${name}" ;;
+        trojan) name="${DOMAIN}-Trojan-${id:0:8}"; uri="trojan://${id}@${DOMAIN}:${PORT_TROJAN}?security=tls&type=tcp&alpn=${alpn}&sni=${DOMAIN}#${name}" ;;
         hysteria)
             if [[ -z "$id" ]]; then log_error "Please provide a Hysteria password."; exit 1; fi
             local obfs_pass; obfs_pass=${PASSWORD_HYSTERIA_OBFS:-$(grep PASSWORD_HYSTERIA_OBFS "$INSTALL_CONF" | cut -d'"' -f2)}
@@ -802,7 +802,7 @@ systemctl enable hysteria-server
 
 ALPN_URI=$(jq -r '.alpn | join(",")' "$SETTINGS_FILE")
 VLESS_URI="vless://${UUID_VLESS}@${DOMAIN}:${PORT_VLESS}?type=tcp&security=tls&flow=${VLESS_FLOW}&alpn=${ALPN_URI}&sni=${DOMAIN}#${DOMAIN}-VLESS"
-TROJAN_URI="trojan://${PASSWORD_TROJAN}@${DOMAIN}:${PORT_TROJAN}?alpn=${ALPN_URI}&sni=${DOMAIN}#${DOMAIN}-Trojan"
+TROJAN_URI="trojan://${PASSWORD_TROJAN}@${DOMAIN}:${PORT_TROJAN}?security=tls&type=tcp&alpn=h2,http/1.1&sni=${DOMAIN}#${DOMAIN}-Trojan"
 HYSTERIA_URI="hysteria2://${PASSWORD_HYSTERIA}@${DOMAIN}:${PORT_HYSTERIA}?sni=${DOMAIN}&obfs=salamander&obfs-password=${PASSWORD_HYSTERIA_OBFS}#${DOMAIN}-Hysteria2"
 
 trap - ERR

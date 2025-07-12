@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -42,32 +42,31 @@ if [[ "${CONFIRM,,}" != "y" ]]; then
     exit 1
 fi
 
-# Load domain from install.conf if present
 DOMAIN=""
 INSTALL_CONF="/etc/ray-aio/install.conf"
 if [[ -f "$INSTALL_CONF" ]]; then
     # shellcheck source=/dev/null
-    source "$INSTALL_CONF"
+    source "$INSTALL_CONF" || true
 fi
 
 step "Phase 1: Shutting Down and Cleaning Up Services"
 
 step "Stopping & Disabling Services"
 for svc in xray hysteria-server postgresql; do
-    if systemctl is-active --quiet "$svc"; then
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
         echo "Stopping $svc..."
-        systemctl stop "$svc"
+        systemctl stop "$svc" || true
     fi
-    if systemctl is-enabled --quiet "$svc"; then
+    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
         echo "Disabling $svc..."
-        systemctl disable "$svc"
+        systemctl disable "$svc" || true
     fi
 done
 
 step "Flushing Firewall Rules"
 if command -v nft &>/dev/null; then
-    nft flush ruleset
-    nft -s list ruleset > /etc/nftables.conf
+    nft flush ruleset || true
+    nft -s list ruleset > /etc/nftables.conf || true
     echo "Cleared NFTables rules; saved empty config."
 else
     echo "nft command not found; skipping."
@@ -77,11 +76,11 @@ step "Dropping PostgreSQL Database and User"
 DB_CONF="/root/.secrets/db.conf"
 if [[ -f "$DB_CONF" ]]; then
     # shellcheck source=/dev/null
-    source "$DB_CONF"
+    source "$DB_CONF" || true
     if [[ -n "${PG_DB_NAME:-}" && -n "${PG_USER:-}" ]]; then
        echo "Dropping database '$PG_DB_NAME' and user '$PG_USER'..."
-       sudo -u postgres psql -c "DROP DATABASE IF EXISTS \"$PG_DB_NAME\";"
-       sudo -u postgres psql -c "DROP USER IF EXISTS \"$PG_USER\";"
+       sudo -u postgres psql -c "DROP DATABASE IF EXISTS \"$PG_DB_NAME\";" || true
+       sudo -u postgres psql -c "DROP USER IF EXISTS \"$PG_USER\";" || true
        echo "PostgreSQL cleanup complete."
     else
         echo "PostgreSQL config found, but DB name/user variables not set."
@@ -90,18 +89,17 @@ else
     echo "PostgreSQL config not found; skipping database drop."
 fi
 
-
 step "Phase 2: Removing Files and Configurations"
 
 step "Removing Systemd Unit Files"
 remove_file_if_exists "/etc/systemd/system/xray.service"
 remove_file_if_exists "/etc/systemd/system/hysteria-server.service"
-systemctl daemon-reload
+systemctl daemon-reload || true
 
 step "Removing Let's Encrypt Certificate"
 if [[ -n "${DOMAIN}" ]] && command -v certbot &>/dev/null; then
     if certbot certificates --cert-name "$DOMAIN" &>/dev/null; then
-        certbot delete --non-interactive --cert-name "$DOMAIN"
+        certbot delete --non-interactive --cert-name "$DOMAIN" || true
         echo "Deleted certificate for $DOMAIN."
     else
         echo "No certificate found for '$DOMAIN'."
@@ -124,7 +122,6 @@ remove_dir_if_exists "/etc/hysteria"
 remove_dir_if_exists "/root/.secrets"
 remove_file_if_exists "/var/log/raycontrol.log"
 
-
 step "Phase 3: Removing Packages"
 CORE_DEPS=(
   curl wget unzip jq nftables certbot qrencode
@@ -137,7 +134,7 @@ echo -e "${YELLOW}${CORE_DEPS[*]}${NC}"
 echo "Removing these may affect other applications on the system."
 read -rp "Do you want to remove these packages? [y/N]: " RM_DEPS
 if [[ "${RM_DEPS,,}" == "y" ]]; then
-    apt-get remove --purge -y "${CORE_DEPS[@]}"
+    apt-get remove --purge -y "${CORE_DEPS[@]}" || true
     echo -e "${GREEN}Dependencies removed.${NC}"
 else
     echo "Skipped dependency removal."
@@ -147,10 +144,10 @@ step "Optional: XanMod Kernel"
 if [[ -f "/etc/apt/sources.list.d/xanmod-kernel.list" ]]; then
     read -rp "Do you want to remove the XanMod repository and any installed XanMod kernels? [y/N]: " RX
     if [[ "${RX,,}" == "y" ]]; then
-        apt-get remove --purge -y "linux-xanmod-*"
+        apt-get remove --purge -y "linux-xanmod-*" || true
         remove_file_if_exists "/etc/apt/sources.list.d/xanmod-kernel.list"
         remove_file_if_exists "/etc/apt/trusted.gpg.d/xanmod-kernel.gpg"
-        apt-get update
+        apt-get update || true
         echo -e "${YELLOW}A reboot is required to switch to the previous kernel.${NC}"
     else
         echo "Skipped XanMod removal."
