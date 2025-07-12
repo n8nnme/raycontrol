@@ -54,6 +54,7 @@ fi
 
 step "Phase 1: Removing Script-Specific Files (Fully Automated)"
 
+# TODO (Services) It's not stop after it
 step "Disabling and Stopping Services"
 for service in xray hysteria-server; do
     if systemctl list-unit-files | grep -q "^$service.service"; then
