@@ -26,7 +26,8 @@ XRAY_BIN="/usr/local/bin/xray"
 XRAY_SERVICE="/etc/systemd/system/xray.service"
 HYSTERIA_DIR="/etc/hysteria"
 HYSTERIA_CONFIG="$HYSTERIA_DIR/config.yaml"
-HYSTERIA_USERS_DB_FILE="$HYSTERIA_DIR/users.db"
+HYSTERIA_AUTH_SCRIPT="$HYSTERIA_DIR/auth.sh"
+HYSTERIA_DB_CONF="$HYSTERIA_DIR/db.conf"
 HYSTERIA_BIN="/usr/local/bin/hysteria-server"
 HYSTERIA_SERVICE="/etc/systemd/system/hysteria-server.service"
 SECRETS_DIR="/root/.secrets"
@@ -38,10 +39,10 @@ TEMP_ZIP="/tmp/Xray-linux-64.zip"
 TEMP_AWK="/tmp/check_x86_v_level.awk"
 
 # --- Configuration: Colors ---
-GREEN='\\033[0;32m'
-YELLOW='\\033[1;33m'
-RED='\\033[0;31m'
-NC='\\033[0m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
 
 # --- Logging Functions ---
 log_msg() {
@@ -123,8 +124,8 @@ read -rp "Cloudflare API Token: " CF_API_TOKEN
 read -rp "Let’s Encrypt email: " EMAIL
 
 log_info "--- Verifying Cloudflare API Token ---"
-CF_ZONE_ID_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN" \\
-  -H "Authorization: Bearer $CF_API_TOKEN" \\
+CF_ZONE_ID_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN" \
+  -H "Authorization: Bearer $CF_API_TOKEN" \
   -H "Content-Type: application/json")
 if ! echo "$CF_ZONE_ID_RESPONSE" | jq -e '.success' &>/dev/null; then
     ERROR_MSG=$(echo "$CF_ZONE_ID_RESPONSE" | jq -r '.errors[0].message' 2>/dev/null || echo "Unknown error")
@@ -169,7 +170,7 @@ echo "Trojan Port (TCP):  $PORT_TROJAN"
 echo "Hysteria2 Port (UDP):$PORT_HYSTERIA"
 echo "Knock Ports:        $K1, $K2, $K3"
 if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then echo "Install XanMod:     Yes"; fi
-echo -e "${YELLOW}----------------------------${NC}\\n"
+echo -e "${YELLOW}----------------------------${NC}\n"
 
 read -rp "Proceed with installation? [y/N]: " CONFIRM
 if [[ "${CONFIRM,,}" != "y" ]]; then echo "Installation cancelled."; trap - ERR; exit 0; fi
@@ -178,7 +179,7 @@ log_info "--- Installing Core Dependencies ---"
 apt-get update
 apt-get install -y curl wget unzip jq nftables certbot qrencode python3-certbot-dns-cloudflare uuid-runtime openssl socat gawk dnsutils bc coreutils watch postgresql postgresql-client
 
-mkdir -p "$RAY_AIO_DIR" "/var/backups/ray-aio" "$SECRETS_DIR"
+mkdir -p "$RAY_AIO_DIR" "/var/backups/ray-aio" "$SECRETS_DIR" "$HYSTERIA_DIR"
 
 cat > "$INSTALL_CONF" <<EOF
 DOMAIN="$DOMAIN"
@@ -212,6 +213,9 @@ PG_DB_NAME="$PG_DB_NAME"
 PG_PASSWORD="$PG_PASSWORD"
 EOF
 chmod 600 "$DB_CONF"
+cp "$DB_CONF" "$HYSTERIA_DB_CONF"
+chown nobody:nogroup "$HYSTERIA_DB_CONF"
+chmod 600 "$HYSTERIA_DB_CONF"
 
 systemctl enable --now postgresql
 sudo -u postgres psql -c "CREATE DATABASE $PG_DB_NAME;"
@@ -258,9 +262,9 @@ AWK
     chmod +x "$TEMP_AWK"; XANMOD_PKG_NAME="linux-xanmod-lts-x64v1"; CPU_LEVEL_EXIT_CODE=0
     "$TEMP_AWK" || CPU_LEVEL_EXIT_CODE=$?; rm -f "$TEMP_AWK"
     case $CPU_LEVEL_EXIT_CODE in
-        3) XANMOD_PKG_NAME="linux-xanmod-lts-x64v2" ;;
-        4) XANMOD_PKG_NAME="linux-xanmod-lts-x64v3" ;;
-        5) XANMOD_PKG_NAME="linux-xanmod-lts-x64v3" ;;
+        3) XANMOD_PKG_NAME="linux-xanmod-x64v2" ;;
+        4) XANMOD_PKG_NAME="linux-xanmod-x64v3" ;;
+        5) XANMOD_PKG_NAME="linux-xanmod-x64v3" ;;
         *) XANMOD_PKG_NAME="linux-xanmod-lts-x64v1" ;;
     esac
     log_info "--- Installing XanMod Kernel ($XANMOD_PKG_NAME) ---"
@@ -269,11 +273,12 @@ fi
 
 UUID_VLESS=$(uuidgen); PASSWORD_TROJAN=$(head -c16 /dev/urandom | base64 | tr '+/' '_-' | cut -c1-16)
 PASSWORD_HYSTERIA=$(head -c32 /dev/urandom | base64 | tr '+/' '_-'); PASSWORD_HYSTERIA_OBFS=$(head -c32 /dev/urandom | base64 | tr '+/' '_-')
+echo "PASSWORD_HYSTERIA_OBFS=\"$PASSWORD_HYSTERIA_OBFS\"" >> "$INSTALL_CONF"
 
 log_info "--- Validating DNS Records ---"
 SERVER_IP=$(curl -s https://ipwho.de/ip); if [[ -z "$SERVER_IP" ]]; then log_error "Could not determine server's public IP address."; exit 1; fi
 log_info "This server's public IP is: $SERVER_IP"; log_warn "Please ensure you have an A record for $DOMAIN pointing to this IP in your Cloudflare DNS."
-log_warn "Waiting 30 seconds for DNS to propagate..."; for i in {30..1}; do printf "\\rWaiting... %2d" "$i"; sleep 1; done; echo -e "\\rDone waiting. Now checking DNS resolution."
+log_warn "Waiting 30 seconds for DNS to propagate..."; for i in {30..1}; do printf "\rWaiting... %2d" "$i"; sleep 1; done; echo -e "\rDone waiting. Now checking DNS resolution."
 RESOLVED_IP=$(dig +short "$DOMAIN" @1.1.1.1 || echo ""); log_info "Resolved IP for $DOMAIN is: ${RESOLVED_IP:-Not found}"
 if [[ "$RESOLVED_IP" != "$SERVER_IP" ]]; then log_error "DNS validation failed! The domain $DOMAIN does not resolve to this server's IP ($SERVER_IP)."; exit 1; fi
 log_info "DNS validation successful!"
@@ -298,13 +303,13 @@ fi
 # --- Config Paths ---
 RAY_AIO_DIR="/etc/ray-aio"; SECRETS_DIR="/root/.secrets"; DB_CONF="$SECRETS_DIR/db.conf"
 XRAY_DIR="/etc/xray"; XCONF="${XRAY_DIR}/config.json"; XCONF_TPL="${XRAY_DIR}/config.json.tpl"
-HYSTERIA_DIR="/etc/hysteria"; HYSTERIA_CONF="${HYSTERIA_DIR}/config.yaml"; HYSTERIA_USERS_DB_FILE="${HYSTERIA_DIR}/users.db"
+HYSTERIA_DIR="/etc/hysteria"; HYSTERIA_CONF="${HYSTERIA_DIR}/config.yaml"
 BACKUP_DIR="/var/backups/ray-aio"; INSTALL_CONF="${RAY_AIO_DIR}/install.conf"
 SETTINGS_FILE="${RAY_AIO_DIR}/settings.json"; LOG_FILE="/var/log/raycontrol.log"
 ENABLED_FLAG="${XRAY_DIR}/enabled.flag"; NFT_TABLE="inet filter"; NFT_SET="xray_clients"
 
 # --- Colors ---
-GREEN='\\033[0;32m'; YELLOW='\\033[1;33m'; RED='\\033[0;31m'; NC='\\033[0m'
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 
 # --- Logging ---
 log_msg() {
@@ -357,8 +362,6 @@ regenerate_configs() {
 
     echo "$xray_config" > "$XCONF"
     log_info "Xray config.json regenerated."
-    $PSQL_CMD -c "SELECT password FROM hysteria_users;" > "$HYSTERIA_USERS_DB_FILE"
-    log_info "Hysteria users file regenerated."
 }
 
 show_qr() {
@@ -374,25 +377,27 @@ show_qr() {
         trojan) name="${DOMAIN}-Trojan-${id:0:8}"; uri="trojan://${id}@${DOMAIN}:${PORT_TROJAN}?alpn=${alpn}&sni=${DOMAIN}#${name}" ;;
         hysteria)
             if [[ -z "$id" ]]; then log_error "Please provide a Hysteria password."; exit 1; fi
-            local obfs_pass; obfs_pass=$(awk '/password:/ {print $2}' "$HYSTERIA_CONF")
+            local obfs_pass; obfs_pass=$PASSWORD_HYSTERIA_OBFS
             if [[ -z "$obfs_pass" ]]; then log_error "Could not read Hysteria OBFS password"; exit 1; fi
             name="${DOMAIN}-Hysteria2-${id:0:6}"; uri="hysteria2://${id}@${DOMAIN}:${PORT_HYSTERIA}?sni=${DOMAIN}&obfs=salamander&obfs-password=${obfs_pass}#${name}"
             ;;
         *) log_error "Invalid type specified for QR code generation."; return 1;;
     esac
     log_warn "--- QR Code for: $name ---"
-    qrencode -t ANSIUTF8 "$uri"; echo -e "${YELLOW}URI: ${uri}${NC}\\n"
+    qrencode -t ANSIUTF8 "$uri"; echo -e "${YELLOW}URI: ${uri}${NC}\n"
 }
 
 add_user(){
     local type="$1"; local new_id=""
     case "$type" in
-        vless) new_id=$(uuidgen); $PSQL_CMD -c "INSERT INTO xray_users (type, user_id) VALUES ('vless', '$new_id');"; log_info "Added VLESS user to database: $new_id" ;;
-        trojan) new_id=$(head -c16 /dev/urandom | base64 | tr '+/' '_-' | cut -c1-16); $PSQL_CMD -c "INSERT INTO xray_users (type, user_id) VALUES ('trojan', '$new_id');"; log_info "Added Trojan user to database. Password: $new_id" ;;
+        vless) new_id=$(uuidgen); $PSQL_CMD -c "INSERT INTO xray_users (type, user_id) VALUES ('vless', '$new_id');"; log_info "Added VLESS user to database: $new_id"
+               regenerate_configs; reload_services xray ;;
+        trojan) new_id=$(head -c16 /dev/urandom | base64 | tr '+/' '_-' | cut -c1-16); $PSQL_CMD -c "INSERT INTO xray_users (type, user_id) VALUES ('trojan', '$new_id');"; log_info "Added Trojan user to database. Password: $new_id"
+                regenerate_configs; reload_services xray ;;
         hysteria) new_id=$(head -c32 /dev/urandom | base64 | tr '+/' '_-'); $PSQL_CMD -c "INSERT INTO hysteria_users (password) VALUES ('$new_id');"; log_info "Added Hysteria2 user to database. Password: $new_id" ;;
         *) log_error "Usage: raycontrol add-user [vless|trojan|hysteria]"; exit 1 ;;
     esac
-    regenerate_configs; reload_services; log_info "Configurations updated and services reloaded."
+    log_info "User added."
     show_qr "$type" "$new_id"
 }
 
@@ -400,19 +405,20 @@ del_user(){
     local id_to_del="$1"; if [ -z "$id_to_del" ]; then log_error "Please provide a user ID or password to delete."; exit 1; fi
     local xray_deleted_count; xray_deleted_count=$($PSQL_CMD -c "DELETE FROM xray_users WHERE user_id = '$id_to_del';" | sed 's/DELETE //g')
     local hysteria_deleted_count; hysteria_deleted_count=$($PSQL_CMD -c "DELETE FROM hysteria_users WHERE password = '$id_to_del';" | sed 's/DELETE //g')
-    if (( xray_deleted_count > 0 || hysteria_deleted_count > 0 )); then
-        log_info "Removed user '$id_to_del' from the database."; regenerate_configs; reload_services
-        log_info "Configurations updated and services reloaded."
+    if (( xray_deleted_count > 0 )); then
+        log_info "Removed Xray user '$id_to_del' from the database."; regenerate_configs; reload_services xray
+    elif (( hysteria_deleted_count > 0 )); then
+        log_info "Removed Hysteria user '$id_to_del' from the database."
     else log_error "User not found: $id_to_del"; exit 1; fi
 }
 
 list_users(){
     log_warn "--- Xray Users (VLESS/Trojan) from PostgreSQL ---"
     local xray_output; xray_output=$($PSQL_CMD -c "SELECT type, user_id FROM xray_users ORDER BY type, id;")
-    echo -e "TYPE\\tID/PASSWORD"
+    echo -e "TYPE\tID/PASSWORD"
     echo "----------------------------------------"
     if [[ -n "$xray_output" ]]; then
-        echo "$xray_output" | sed 's/|/\\t/' | column -t -s $'\\t'
+        echo "$xray_output" | sed 's/|/\t/' | column -t -s $'\t'
     else
         echo "(none)"
     fi
@@ -436,7 +442,7 @@ backup_config() {
     log_info "Backing up PostgreSQL database to $temp_dir/ray_aio_db.sql"
     pg_dump -h "$PG_HOST" -U "$PG_USER" -d "$PG_DB_NAME" > "$temp_dir/ray_aio_db.sql"
     log_info "Backing up configuration files..."
-    cp -r /etc/letsencrypt "$temp_dir/"; cp -r "$RAY_AIO_DIR" "$temp_dir/"; cp -r "$SECRETS_DIR" "$temp_dir/"
+    cp -r /etc/letsencrypt "$temp_dir/"; cp -r "$RAY_AIO_DIR" "$temp_dir/"; cp -r "$SECRETS_DIR" "$temp_dir/"; cp -r "$HYSTERIA_DIR" "$temp_dir/"
     log_info "Creating backup archive: $backup_file"
     tar -czf "$backup_file" -C "$temp_dir" .; rm -rf "$temp_dir"
     log_info "Backup complete! Archive is located at $backup_file"
@@ -452,12 +458,15 @@ restore_config() {
     log_info "Disabling services..."; "$0" disable
     log_info "Extracting backup file..."; tar -xzf "$backup_file" -C "$temp_dir"
     log_info "Restoring configuration files..."
-    cp -a "$temp_dir/letsencrypt/." /etc/letsencrypt/; cp -a "$temp_dir/ray-aio/." "$RAY_AIO_DIR/"; cp -a "$temp_dir/secrets/." "$SECRETS_DIR/"
+    cp -a "$temp_dir/letsencrypt/." /etc/letsencrypt/; cp -a "$temp_dir/ray-aio/." "$RAY_AIO_DIR/"; cp -a "$temp_dir/secrets/." "$SECRETS_DIR/"; cp -a "$temp_dir/hysteria/." "$HYSTERIA_DIR/"
     log_info "Restoring PostgreSQL database..."; source "$DB_CONF"; export PGPASSWORD=$PG_PASSWORD
     sudo -u postgres psql -c "DROP DATABASE IF EXISTS $PG_DB_NAME;"; sudo -u postgres psql -c "CREATE DATABASE $PG_DB_NAME;"
     sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $PG_DB_NAME TO $PG_USER;"
     psql -h "$PG_HOST" -U "$PG_USER" -d "$PG_DB_NAME" < "$temp_dir/ray_aio_db.sql"
     log_info "Regenerating service configs from restored database..."; regenerate_configs
+    chown nobody:nogroup "$HYSTERIA_DB_CONF"; chmod 600 "$HYSTERIA_DB_CONF"
+    chown nobody:nogroup "$HYSTERIA_CONFIG"; chmod 600 "$HYSTERIA_CONFIG"
+    chown nobody:nogroup "$HYSTERIA_AUTH_SCRIPT"; chmod 700 "$HYSTERIA_AUTH_SCRIPT"
     rm -rf "$temp_dir"; log_info "Restore complete. Run 'raycontrol enable' to restart services."
 }
 
@@ -500,7 +509,7 @@ case "${1:-help}" in
   restore) restore_config "${2:-}" ;; list-users) list_users ;; add-user) add_user "${2:-}" ;;
   del-user) del_user "${2:-}" ;; show-qr) show_qr "${2:-}" "${3:-}" ;; list-ips) list_ips ;;
   add-ip) add_ip "${2:-}" ;; del-ip) del_ip "${2:-}" ;; check-conns) check_conns "${2:-}" ;;
-  regenerate-configs) regenerate_configs && reload_services ;;
+  regenerate-configs) regenerate_configs && reload_services xray ;;
   *) help ;;
 esac
 EOF
@@ -545,9 +554,8 @@ mkdir -p "$LE_POST_HOOK_DIR"
 cat > "$LE_POST_HOOK_SCRIPT" <<'EOF'
 #!/usr/bin/env bash
 # This script is run by certbot after a successful renewal.
-# The `deploy-hook` feature of certbot will handle service reloads.
-# This script can be used for additional custom actions.
 /usr/local/bin/raycontrol regenerate-configs
+reload_services
 EOF
 chmod +x "$LE_POST_HOOK_SCRIPT"
 
@@ -569,7 +577,7 @@ cat > "$XRAY_CONFIG_TPL" <<EOF
       "port": $PORT_VLESS,
       "protocol": "vless",
       "settings": {"clients": [], "decryption": "none"},
-      "streamSettings": {"network": "tcp", "security": "xtls", "xtlsSettings": {"certificates": [{"certificateFile": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem", "keyFile": "/etc/letsencrypt/live/$DOMAIN/privkey.pem"}], "alpn": $XRAY_ALPN}}
+      "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": {"certificates": [{"certificateFile": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem", "keyFile": "/etc/letsencrypt/live/$DOMAIN/privkey.pem"}], "alpn": $XRAY_ALPN}}
     },
     {
       "port": $PORT_TROJAN,
@@ -601,19 +609,18 @@ EOF
 
 log_info "--- Installing Hysteria2 ---"
 RAW_TAG=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r .tag_name)
-ENC_TAG=${RAW_TAG//\\//%2F}
+ENC_TAG=${RAW_TAG//\//%2F}
 wget -nv -O "$HYSTERIA_BIN" "https://github.com/apernet/hysteria/releases/download/${ENC_TAG}/hysteria-linux-amd64-musl"
 chmod +x "$HYSTERIA_BIN"; log_info "Hysteria2 installed successfully!"
 
-mkdir -p "$HYSTERIA_DIR"; cat > "$HYSTERIA_CONFIG" <<EOF
+cat > "$HYSTERIA_CONFIG" <<EOF
 listen: :$PORT_HYSTERIA
 tls:
   cert: /etc/letsencrypt/live/$DOMAIN/fullchain.pem
   key: /etc/letsencrypt/live/$DOMAIN/privkey.pem
 auth:
-  type: file
-  file:
-    path: $HYSTERIA_USERS_DB_FILE
+  type: command
+  command: $HYSTERIA_AUTH_SCRIPT
 obfs:
   type: salamander
   salamander:
@@ -625,10 +632,31 @@ masquerade:
     rewriteHost: true
 EOF
 
+cat > "$HYSTERIA_AUTH_SCRIPT" <<EOF
+#!/bin/bash
+set -e
+ADDR=\$1
+AUTH=\$2
+TX=\$3
+source "$HYSTERIA_DB_CONF"
+export PGPASSWORD=\$PG_PASSWORD
+EXISTS=\$(psql -h \$PG_HOST -U \$PG_USER -d \$PG_DB_NAME -t -c "SELECT COUNT(*) FROM hysteria_users WHERE password = '\$AUTH';")
+if [ \$EXISTS -gt 0 ]; then
+  ID=\$(psql -h \$PG_HOST -U \$PG_USER -d \$PG_DB_NAME -t -c "SELECT id FROM hysteria_users WHERE password = '\$AUTH';")
+  echo "\$ID"
+  exit 0
+else
+  exit 1
+fi
+EOF
+chmod 700 "$HYSTERIA_AUTH_SCRIPT"
+chown nobody:nogroup "$HYSTERIA_AUTH_SCRIPT"
+
 cat > "$HYSTERIA_SERVICE" <<EOF
 [Unit]
 Description=Hysteria2 Service
-After=network.target nss-lookup.target
+After=network.target nss-lookup.target postgresql.service
+Requires=postgresql.service
 [Service]
 User=nobody
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
@@ -645,7 +673,7 @@ log_info "--- Generating Initial Configs and Setting Permissions ---"
 "$RAYCONTROL_PATH" regenerate-configs
 usermod -aG ssl-cert nobody
 chown -R nobody:nogroup "$XRAY_DIR" "$HYSTERIA_DIR"
-chmod 600 "$HYSTERIA_USERS_DB_FILE"
+chmod 600 "$HYSTERIA_CONFIG"
 chgrp -R ssl-cert /etc/letsencrypt/live /etc/letsencrypt/archive
 chmod -R g+rx /etc/letsencrypt/live /etc/letsencrypt/archive
 
@@ -660,31 +688,31 @@ HYSTERIA_URI="hysteria2://${PASSWORD_HYSTERIA}@${DOMAIN}:${PORT_HYSTERIA}?sni=${
 
 trap - ERR
 log_info "--- Installation successful! ---"
-echo -e "\\n\\n${YELLOW}=====================================================${NC}"
+echo -e "\n\n${YELLOW}=====================================================${NC}"
 echo -e "${YELLOW}               ACTION REQUIRED TO ACTIVATE               ${NC}"
-echo -e "${YELLOW}=====================================================${NC}\\n"
+echo -e "${YELLOW}=====================================================${NC}\n"
 if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
     echo -e "${YELLOW}IMPORTANT: A reboot is required to use the new XanMod kernel.${NC}"
-    echo -e "After rebooting, run '${GREEN}$RAYCONTROL_PATH enable${NC}'.\\n"
+    echo -e "After rebooting, run '${GREEN}$RAYCONTROL_PATH enable${NC}'.\n"
 else
     echo -e "Services are installed but NOT RUNNING. The firewall is NOT ACTIVE."
-    echo -e "To start all services and apply the firewall, run:\\n\\n  ${GREEN}$RAYCONTROL_PATH enable${NC}\\n"
+    echo -e "To start all services and apply the firewall, run:\n\n  ${GREEN}$RAYCONTROL_PATH enable${NC}\n"
 fi
 echo -e "Your IP will not be whitelisted automatically. You must perform the port knock first."
 echo -e "An IP will be removed from the whitelist after 10 minutes of inactivity."
-echo -e "\\n${YELLOW}--- Initial Connection Info (once enabled) ---${NC}"
+echo -e "\n${YELLOW}--- Initial Connection Info (once enabled) ---${NC}"
 echo "Knock sequence for all services: $K1 -> $K2 -> $K3"; echo "SSH Port: $SSH_PORT"; echo
 echo -e "${YELLOW}VLESS (TCP, ALPN: $ALPN_URI):${NC}"; echo "  Port: $PORT_VLESS, UUID: $UUID_VLESS"; echo
 echo -e "${YELLOW}Trojan (TCP, ALPN: $ALPN_URI):${NC}"; echo "  Port: $PORT_TROJAN, Password: $PASSWORD_TROJAN"; echo
 echo -e "${YELLOW}Hysteria2 (UDP):${NC}"; echo "  Port: $PORT_HYSTERIA"; echo "  Initial Auth Pass: $PASSWORD_HYSTERIA"
 echo "  OBFS Pass: $PASSWORD_HYSTERIA_OBFS"
 if command -v qrencode &> /dev/null; then
-  echo -e "\\n${YELLOW}--- QR Codes for Initial Users ---${NC}"
+  echo -e "\n${YELLOW}--- QR Codes for Initial Users ---${NC}"
   echo "VLESS Configuration:"; qrencode -t ANSIUTF8 "$VLESS_URI"
   echo "Trojan Configuration:"; qrencode -t ANSIUTF8 "$TROJAN_URI"
   echo "Hysteria2 Configuration:"; qrencode -t ANSIUTF8 "$HYSTERIA_URI"
 else
-  echo -e "\\n${YELLOW}--- Configuration URIs ---${NC}"; echo "VLESS: $VLESS_URI"; echo "Trojan: $TROJAN_URI"; echo "Hysteria2: $HYSTERIA_URI"
+  echo -e "\n${YELLOW}--- Configuration URIs ---${NC}"; echo "VLESS: $VLESS_URI"; echo "Trojan: $TROJAN_URI"; echo "Hysteria2: $HYSTERIA_URI"
 fi
-echo -e "\\nUse ${GREEN}'$RAYCONTROL_PATH help'${NC} for a full list of commands."
-echo -e "\\n${GREEN}=========================================================================================${NC}\\n"
+echo -e "\nUse ${GREEN}'$RAYCONTROL_PATH help'${NC} for a full list of commands."
+echo -e "\n${GREEN}=========================================================================================${NC}\n"
