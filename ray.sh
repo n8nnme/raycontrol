@@ -84,8 +84,8 @@ cleanup() {
         # shellcheck source=/dev/null
         source "$DB_CONF"
         if [[ -n "${PG_DB_NAME:-}" && -n "${PG_USER:-}" ]]; then
-           sudo -u postgres psql -c "DROP DATABASE IF EXISTS $PG_DB_NAME;" &>/dev/null
-           sudo -u postgres psql -c "DROP USER IF EXISTS $PG_USER;" &>/dev/null
+           sudo -u postgres psql -c "DROP DATABASE IF EXISTS \"$PG_DB_NAME\";" &>/dev/null
+           sudo -u postgres psql -c "DROP USER IF EXISTS \"$PG_USER\";" &>/dev/null
         fi
         log_warn "Purging PostgreSQL packages..."
         apt-get purge -y --auto-remove postgresql* &>/dev/null
@@ -219,10 +219,10 @@ chmod 600 "$HYSTERIA_DB_CONF"
 
 systemctl enable --now postgresql
 
-sudo -i -u postgres bash <<'EOF'
-psql -c "CREATE DATABASE $PG_DB_NAME;"
-psql -c "CREATE USER $PG_USER WITH PASSWORD '$PG_PASSWORD';"
-psql -c "GRANT ALL PRIVILEGES ON DATABASE $PG_DB_NAME TO $PG_USER;"
+sudo -u postgres psql -c "CREATE DATABASE \"$PG_DB_NAME\";"
+sudo -u postgres psql -c "CREATE USER \"$PG_USER\" WITH PASSWORD '$PG_PASSWORD';"
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"$PG_DB_NAME\" TO \"$PG_USER\";"
+
 export PGPASSWORD=$PG_PASSWORD
 psql -h localhost -U "$PG_USER" -d "$PG_DB_NAME" -c "
   CREATE TABLE xray_users (
@@ -237,7 +237,6 @@ psql -h localhost -U "$PG_USER" -d "$PG_DB_NAME" -c "
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
   );
 "
-EOF
 unset PGPASSWORD
 log_info "PostgreSQL user '$PG_USER' and database '$PG_DB_NAME' created."
 log_info "PostgreSQL is configured for local network connections only by default via pg_hba.conf."
@@ -264,9 +263,9 @@ AWK
     chmod +x "$TEMP_AWK"; XANMOD_PKG_NAME="linux-xanmod-lts-x64v1"; CPU_LEVEL_EXIT_CODE=0
     "$TEMP_AWK" || CPU_LEVEL_EXIT_CODE=$?; rm -f "$TEMP_AWK"
     case $CPU_LEVEL_EXIT_CODE in
-        3) XANMOD_PKG_NAME="linux-xanmod-x64v2" ;;
-        4) XANMOD_PKG_NAME="linux-xanmod-x64v3" ;;
-        5) XANMOD_PKG_NAME="linux-xanmod-x64v3" ;;
+        3) XANMOD_PKG_NAME="linux-xanmod-lts-x64v2" ;;
+        4) XANMOD_PKG_NAME="linux-xanmod-lts-x64v3" ;;
+        5) XANMOD_PKG_NAME="linux-xanmod-lts-x64v4" ;;
         *) XANMOD_PKG_NAME="linux-xanmod-lts-x64v1" ;;
     esac
     log_info "--- Installing XanMod Kernel ($XANMOD_PKG_NAME) ---"
@@ -354,12 +353,15 @@ regenerate_configs() {
     local vless_clients_json; vless_clients_json=$($PSQL_CMD -c "SELECT json_agg(json_build_object('id', user_id, 'flow', '$vless_flow')) FROM xray_users WHERE type = 'vless';")
     local trojan_clients_json; trojan_clients_json=$($PSQL_CMD -c "SELECT json_agg(json_build_object('password', user_id)) FROM xray_users WHERE type = 'trojan';")
 
-    # Only add clients if the JSON is not 'null'
     if [[ "$vless_clients_json" != "null" ]]; then
         xray_config=$(echo "$xray_config" | jq --argjson clients "$vless_clients_json" '.inbounds[0].settings.clients = $clients')
+    else
+        xray_config=$(echo "$xray_config" | jq '.inbounds[0].settings.clients = []')
     fi
     if [[ "$trojan_clients_json" != "null" ]]; then
         xray_config=$(echo "$xray_config" | jq --argjson clients "$trojan_clients_json" '.inbounds[1].settings.clients = $clients')
+    else
+         xray_config=$(echo "$xray_config" | jq '.inbounds[1].settings.clients = []')
     fi
 
     echo "$xray_config" > "$XCONF"
@@ -370,6 +372,7 @@ show_qr() {
     local type="$1"; local id="$2"
     if ! command -v qrencode &> /dev/null; then log_error "Error: 'qrencode' is not installed."; return 1; fi
     if [ ! -f "$INSTALL_CONF" ] || [ ! -f "$SETTINGS_FILE" ]; then log_error "Core config files not found"; exit 1; fi
+    # shellcheck source=/dev/null
     source "$INSTALL_CONF"
     local vless_flow; vless_flow=$(jq -r '.vless_flow' "$SETTINGS_FILE")
     local alpn; alpn=$(jq -r '.alpn | join(",")' "$SETTINGS_FILE")
@@ -379,7 +382,7 @@ show_qr() {
         trojan) name="${DOMAIN}-Trojan-${id:0:8}"; uri="trojan://${id}@${DOMAIN}:${PORT_TROJAN}?alpn=${alpn}&sni=${DOMAIN}#${name}" ;;
         hysteria)
             if [[ -z "$id" ]]; then log_error "Please provide a Hysteria password."; exit 1; fi
-            local obfs_pass; obfs_pass=$PASSWORD_HYSTERIA_OBFS
+            local obfs_pass; obfs_pass=${PASSWORD_HYSTERIA_OBFS:-$(grep PASSWORD_HYSTERIA_OBFS "$INSTALL_CONF" | cut -d'"' -f2)}
             if [[ -z "$obfs_pass" ]]; then log_error "Could not read Hysteria OBFS password"; exit 1; fi
             name="${DOMAIN}-Hysteria2-${id:0:6}"; uri="hysteria2://${id}@${DOMAIN}:${PORT_HYSTERIA}?sni=${DOMAIN}&obfs=salamander&obfs-password=${obfs_pass}#${name}"
             ;;
@@ -444,7 +447,7 @@ backup_config() {
     log_info "Backing up PostgreSQL database to $temp_dir/ray_aio_db.sql"
     pg_dump -h "$PG_HOST" -U "$PG_USER" -d "$PG_DB_NAME" > "$temp_dir/ray_aio_db.sql"
     log_info "Backing up configuration files..."
-    cp -r /etc/letsencrypt "$temp_dir/"; cp -r "$RAY_AIO_DIR" "$temp_dir/"; cp -r "$SECRETS_DIR" "$temp_dir/"; cp -r "$HYSTERIA_DIR" "$temp_dir/"
+    cp -a /etc/letsencrypt "$temp_dir/"; cp -a "$RAY_AIO_DIR" "$temp_dir/"; cp -a "$SECRETS_DIR" "$temp_dir/"; cp -a "$HYSTERIA_DIR" "$temp_dir/"
     log_info "Creating backup archive: $backup_file"
     tar -czf "$backup_file" -C "$temp_dir" .; rm -rf "$temp_dir"
     log_info "Backup complete! Archive is located at $backup_file"
@@ -462,8 +465,8 @@ restore_config() {
     log_info "Restoring configuration files..."
     cp -a "$temp_dir/letsencrypt/." /etc/letsencrypt/; cp -a "$temp_dir/ray-aio/." "$RAY_AIO_DIR/"; cp -a "$temp_dir/secrets/." "$SECRETS_DIR/"; cp -a "$temp_dir/hysteria/." "$HYSTERIA_DIR/"
     log_info "Restoring PostgreSQL database..."; source "$DB_CONF"; export PGPASSWORD=$PG_PASSWORD
-    sudo -u postgres psql -c "DROP DATABASE IF EXISTS $PG_DB_NAME;"; sudo -u postgres psql -c "CREATE DATABASE $PG_DB_NAME;"
-    sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $PG_DB_NAME TO $PG_USER;"
+    sudo -u postgres psql -c "DROP DATABASE IF EXISTS \"$PG_DB_NAME\";"; sudo -u postgres psql -c "CREATE DATABASE \"$PG_DB_NAME\";"
+    sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"$PG_DB_NAME\" TO \"$PG_USER\";"
     psql -h "$PG_HOST" -U "$PG_USER" -d "$PG_DB_NAME" < "$temp_dir/ray_aio_db.sql"
     log_info "Regenerating service configs from restored database..."; regenerate_configs
     chown nobody:nogroup "$HYSTERIA_DB_CONF"; chmod 600 "$HYSTERIA_DB_CONF"
@@ -511,7 +514,7 @@ case "${1:-help}" in
   restore) restore_config "${2:-}" ;; list-users) list_users ;; add-user) add_user "${2:-}" ;;
   del-user) del_user "${2:-}" ;; show-qr) show_qr "${2:-}" "${3:-}" ;; list-ips) list_ips ;;
   add-ip) add_ip "${2:-}" ;; del-ip) del_ip "${2:-}" ;; check-conns) check_conns "${2:-}" ;;
-  regenerate-configs) regenerate_configs && reload_services xray ;;
+  regenerate-configs) regenerate_configs && reload_services ;;
   *) help ;;
 esac
 EOF
@@ -557,7 +560,7 @@ cat > "$LE_POST_HOOK_SCRIPT" <<'EOF'
 #!/usr/bin/env bash
 # This script is run by certbot after a successful renewal.
 /usr/local/bin/raycontrol regenerate-configs
-reload_services
+/usr/local/bin/raycontrol reload_services
 EOF
 chmod +x "$LE_POST_HOOK_SCRIPT"
 
@@ -576,16 +579,16 @@ cat > "$XRAY_CONFIG_TPL" <<EOF
   },
   "inbounds": [
     {
-      "port": $PORT_VLESS,
+      "port": ${PORT_VLESS},
       "protocol": "vless",
       "settings": {"clients": [], "decryption": "none"},
-      "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": {"certificates": [{"certificateFile": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem", "keyFile": "/etc/letsencrypt/live/$DOMAIN/privkey.pem"}], "alpn": $XRAY_ALPN}}
+      "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": {"certificates": [{"certificateFile": "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem", "keyFile": "/etc/letsencrypt/live/${DOMAIN}/privkey.pem"}], "alpn": ${XRAY_ALPN}}}
     },
     {
-      "port": $PORT_TROJAN,
+      "port": ${PORT_TROJAN},
       "protocol": "trojan",
       "settings": {"clients": [], "fallbacks": [{"dest": "@blackhole"}]},
-      "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": {"certificates": [{"certificateFile": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem", "keyFile": "/etc/letsencrypt/live/$DOMAIN/privkey.pem"}], "alpn": $XRAY_ALPN}}
+      "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": {"certificates": [{"certificateFile": "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem", "keyFile": "/etc/letsencrypt/live/${DOMAIN}/privkey.pem"}], "alpn": ${XRAY_ALPN}}}
     }
   ],
   "outbounds": [{"protocol": "freedom"}, {"protocol": "blackhole", "tag": "@blackhole"}]
@@ -634,18 +637,19 @@ masquerade:
     rewriteHost: true
 EOF
 
-cat > "$HYSTERIA_AUTH_SCRIPT" <<EOF
+cat > "$HYSTERIA_AUTH_SCRIPT" <<'EOF'
 #!/bin/bash
 set -e
-ADDR=\$1
-AUTH=\$2
-TX=\$3
-source "$HYSTERIA_DB_CONF"
-export PGPASSWORD=\$PG_PASSWORD
-EXISTS=\$(psql -h \$PG_HOST -U \$PG_USER -d \$PG_DB_NAME -t -c "SELECT COUNT(*) FROM hysteria_users WHERE password = '\$AUTH';")
-if [ \$EXISTS -gt 0 ]; then
-  ID=\$(psql -h \$PG_HOST -U \$PG_USER -d \$PG_DB_NAME -t -c "SELECT id FROM hysteria_users WHERE password = '\$AUTH';")
-  echo "\$ID"
+ADDR=$1
+AUTH=$2
+TX=$3
+# shellcheck source=/dev/null
+source "/etc/hysteria/db.conf"
+export PGPASSWORD=$PG_PASSWORD
+EXISTS=$(psql -h "$PG_HOST" -U "$PG_USER" -d "$PG_DB_NAME" -t -c "SELECT COUNT(*) FROM hysteria_users WHERE password = '$AUTH';")
+if [ "${EXISTS:-0}" -gt 0 ]; then
+  ID=$(psql -h "$PG_HOST" -U "$PG_USER" -d "$PG_DB_NAME" -t -c "SELECT id FROM hysteria_users WHERE password = '$AUTH';")
+  echo "$ID"
   exit 0
 else
   exit 1
