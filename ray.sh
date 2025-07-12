@@ -219,10 +219,12 @@ chmod 600 "$HYSTERIA_DB_CONF"
 
 systemctl enable --now postgresql
 
-sudo -u postgres psql -c "CREATE DATABASE \"$PG_DB_NAME\";"
-sudo -u postgres psql -c "CREATE USER \"$PG_USER\" WITH PASSWORD '$PG_PASSWORD';"
-sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"$PG_DB_NAME\" TO \"$PG_USER\";"
-
+ORIG_DIR="$PWD"
+cd /tmp
+sudo -u postgres psql -c "CREATE DATABASE $PG_DB_NAME;"
+sudo -u postgres psql -c "CREATE USER $PG_USER WITH PASSWORD '$PG_PASSWORD';"
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $PG_DB_NAME TO $PG_USER;"
+cd "$ORIG_DIR"
 export PGPASSWORD=$PG_PASSWORD
 psql -h localhost -U "$PG_USER" -d "$PG_DB_NAME" -c "
   CREATE TABLE xray_users (
@@ -263,9 +265,9 @@ AWK
     chmod +x "$TEMP_AWK"; XANMOD_PKG_NAME="linux-xanmod-lts-x64v1"; CPU_LEVEL_EXIT_CODE=0
     "$TEMP_AWK" || CPU_LEVEL_EXIT_CODE=$?; rm -f "$TEMP_AWK"
     case $CPU_LEVEL_EXIT_CODE in
-        3) XANMOD_PKG_NAME="linux-xanmod-lts-x64v2" ;;
-        4) XANMOD_PKG_NAME="linux-xanmod-lts-x64v3" ;;
-        5) XANMOD_PKG_NAME="linux-xanmod-lts-x64v4" ;;
+        3) XANMOD_PKG_NAME="linux-xanmod-x64v2" ;;
+        4) XANMOD_PKG_NAME="linux-xanmod-x64v3" ;;
+        5) XANMOD_PKG_NAME="linux-xanmod-x64v3" ;;
         *) XANMOD_PKG_NAME="linux-xanmod-lts-x64v1" ;;
     esac
     log_info "--- Installing XanMod Kernel ($XANMOD_PKG_NAME) ---"
@@ -475,12 +477,123 @@ restore_config() {
     rm -rf "$temp_dir"; log_info "Restore complete. Run 'raycontrol enable' to restart services."
 }
 
-list_ips(){ echo "Function list_ips placeholder"; }; check_conns(){ echo "Function check_conns placeholder"; }
-add_ip(){ echo "Function add_ip placeholder"; }; del_ip(){ echo "Function del_ip placeholder"; }
+list_ips() {
+    log_warn "--- Whitelisted IPs (nft set $NFT_SET) ---"
+    if nft list set "$NFT_TABLE" "$NFT_SET" >/dev/null 2>&1; then
+        nft list set "$NFT_TABLE" "$NFT_SET" \
+            | awk '/elements/ {for(i=2;i<=NF;i++) print $i}' \
+            | while read -r ip; do
+                local ttl
+                ttl=$(nft -j list set "$NFT_TABLE" "$NFT_SET" \
+                      | jq -r --arg ip "$ip" '.nftables[].set.elem[]?
+                      | select(.elem.addr == $ip).elem.timeout // "static"')
+                printf "%-15s  %s\n" "$ip" "$ttl"
+              done
+    else
+        echo "(no IPs whitelisted)"
+    fi
+}
+add_ip() {
+    local ip="$1"
+    [[ -z "$ip" ]] && { log_error "Usage: raycontrol add-ip <IP>"; exit 1; }
+    if [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log_error "Invalid IPv4 address: $ip"; exit 1
+    fi
+    nft add element "$NFT_TABLE" "$NFT_SET" "{ $ip timeout 24h }" \
+        && log_info "Added $ip to whitelist (24 h)"
+}
+del_ip() {
+    local ip="$1"
+    [[ -z "$ip" ]] && { log_error "Usage: raycontrol del-ip <IP>"; exit 1; }
+    nft delete element "$NFT_TABLE" "$NFT_SET" "{ $ip }" \
+        && log_info "Removed $ip from whitelist" \
+        || log_warn "$ip was not whitelisted"
+}
+
 apply_nftables(){ /usr/local/bin/apply_nftables_xray.sh && nft -s list ruleset > /etc/nftables.conf; };
 enable_all(){ echo "enabled" > "$ENABLED_FLAG"; apply_nftables; reload_services all; log_info "All services and firewall enabled."; }
 disable_all(){ echo "disabled" > "$ENABLED_FLAG"; systemctl stop xray hysteria-server; nft flush ruleset; nft -s list ruleset > /etc/nftables.conf; log_info "All services and firewall disabled."; }
-show_status(){ echo "Function show_status placeholder"; }
+show_status() {
+    log_info "=== Service Status ==="
+    systemctl is-active xray         >/dev/null && log_info "xray: running"         || log_warn "xray: inactive/failed"
+    systemctl is-active hysteria-server >/dev/null && log_info "hysteria: running"  || log_warn "hysteria: inactive/failed"
+
+    log_info "=== Firewall Status ==="
+    if nft list ruleset | grep -q "table inet filter"; then
+        log_info "nftables rules loaded"
+    else
+        log_warn "nftables rules NOT loaded"
+    fi
+
+    [[ -f "$ENABLED_FLAG" ]] \
+        && log_info "services marked as: $(cat "$ENABLED_FLAG")" \
+        || log_warn "services marked as: disabled (flag file missing)"
+}
+monitor() {
+    # Make sure we have the tools we need
+    for cmd in tput clear; do
+        command -v "$cmd" >/dev/null || { log_error "$cmd is required for monitor"; exit 1; }
+    done
+
+    # ANSI colours for dashboard
+    local c_rst c_bold c_hdr c_ok c_warn c_fail
+    c_rst=$(tput sgr0)
+    c_bold=$(tput bold)
+    c_hdr=$(tput setaf 6)   # cyan
+    c_ok=$(tput setaf 2)    # green
+    c_warn=$(tput setaf 3)  # yellow
+    c_fail=$(tput setaf 1)  # red
+
+    trap 'tput cnorm; tput sgr0; exit 0' INT TERM  # restore cursor on Ctrl-C
+
+    tput civis  # hide cursor
+
+    while :; do
+        clear
+
+        # ── Header ----------------------------------------------------------
+        printf '%s%s┌─ Ray-AIO Live Monitor ─────────────────────────────────────┐%s\n' \
+               "$c_hdr" "$c_bold" "$c_rst"
+        printf '%s│ %s │%s\n' "$c_hdr" "$(date '+%Y-%m-%d %H:%M:%S')" "$c_rst"
+        printf '%s└────────────────────────────────────────────────────────────┘%s\n\n' \
+               "$c_hdr" "$c_rst"
+
+        # ── Service health ---------------------------------------------------
+        local xray_st hysteria_st
+        xray_st=$(systemctl is-active xray 2>/dev/null)
+        hysteria_st=$(systemctl is-active hysteria-server 2>/dev/null)
+
+        printf '%sService Status%s\n' "$c_bold" "$c_rst"
+        printf '  xray:        %s%s%s\n' \
+               "$( [[ $xray_st == active ]] && echo "${c_ok}UP" || echo "${c_fail}DOWN" )" "$c_rst"
+        printf '  hysteria:    %s%s%s\n\n' \
+               "$( [[ $hysteria_st == active ]] && echo "${c_ok}UP" || echo "${c_fail}DOWN" )" "$c_rst"
+
+        # ── Active connections ----------------------------------------------
+        printf '%sActive Connections%s\n' "$c_bold" "$c_rst"
+
+        source "$INSTALL_CONF" 2>/dev/null || true
+        local v_port=${PORT_VLESS:-443}
+        local t_port=${PORT_TROJAN:-8443}
+        local h_port=${PORT_HYSTERIA:-3478}
+
+        printf '  VLESS/XTLS (TCP :%s): %s\n' "$v_port" \
+               "$(ss -Htn state established "( dport = :$v_port )" | wc -l)"
+        printf '  Trojan     (TCP :%s): %s\n' "$t_port" \
+               "$(ss -Htn state established "( dport = :$t_port )" | wc -l)"
+        printf '  Hysteria2  (UDP :%s): %s\n\n' "$h_port" \
+               "$(ss -Hun state established "( dport = :$h_port )" | wc -l)"
+
+        # ── Whitelist summary ----------------------------------------------
+        printf '%sWhitelist (nft set %s)%s\n' "$c_bold" "$NFT_SET" "$c_rst"
+        local ip_cnt
+        ip_cnt=$(nft list set "$NFT_TABLE" "$NFT_SET" 2>/dev/null \
+                 | awk '/elements/ {print NF-1}' || echo 0)
+        printf '  IPs whitelisted: %s\n' "$ip_cnt"
+
+        sleep 5
+    done
+}
 
 help(){ cat <<MSG
 Usage: raycontrol <command> [args] [--debug|--verbose]
@@ -513,7 +626,7 @@ case "${1:-help}" in
   monitor) watch -n 5 -t --color "$0" ${VERBOSE_FLAG:-} status ;; backup) backup_config ;;
   restore) restore_config "${2:-}" ;; list-users) list_users ;; add-user) add_user "${2:-}" ;;
   del-user) del_user "${2:-}" ;; show-qr) show_qr "${2:-}" "${3:-}" ;; list-ips) list_ips ;;
-  add-ip) add_ip "${2:-}" ;; del-ip) del_ip "${2:-}" ;; check-conns) check_conns "${2:-}" ;;
+  add-ip) add_ip "${2:-}" ;; del-ip) del_ip "${2:-}" ;;
   regenerate-configs) regenerate_configs && reload_services ;;
   *) help ;;
 esac
@@ -633,7 +746,7 @@ obfs:
 masquerade:
   type: proxy
   proxy:
-    url: https://cloudflare.com
+    url: https://dns11.quad9.net
     rewriteHost: true
 EOF
 
@@ -688,7 +801,7 @@ systemctl enable xray
 systemctl enable hysteria-server
 
 ALPN_URI=$(jq -r '.alpn | join(",")' "$SETTINGS_FILE")
-VLESS_URI="vless://${UUID_VLESS}@${DOMAIN}:${PORT_VLESS}?type=tcp&security=xtls&flow=${VLESS_FLOW}&alpn=${ALPN_URI}&sni=${DOMAIN}#${DOMAIN}-VLESS"
+VLESS_URI="vless://${UUID_VLESS}@${DOMAIN}:${PORT_VLESS}?type=tcp&security=tls&flow=${VLESS_FLOW}&alpn=${ALPN_URI}&sni=${DOMAIN}#${DOMAIN}-VLESS"
 TROJAN_URI="trojan://${PASSWORD_TROJAN}@${DOMAIN}:${PORT_TROJAN}?alpn=${ALPN_URI}&sni=${DOMAIN}#${DOMAIN}-Trojan"
 HYSTERIA_URI="hysteria2://${PASSWORD_HYSTERIA}@${DOMAIN}:${PORT_HYSTERIA}?sni=${DOMAIN}&obfs=salamander&obfs-password=${PASSWORD_HYSTERIA_OBFS}#${DOMAIN}-Hysteria2"
 
