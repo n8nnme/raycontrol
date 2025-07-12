@@ -438,7 +438,7 @@ _print_qr() {
   case "$type" in
     vless)
       name="${DOMAIN}-VLESS-${id:0:8}"
-      uri="vless://${id}@${DOMAIN}:${PORT_VLESS}?type=tcp&security=xtls&flow=${vless_flow}&alpn=${alpn}&sni=${DOMAIN}#${name}"
+      uri="vless://${id}@${DOMAIN}:${PORT_VLESS}?type=tcp&security=tls&flow=${vless_flow}&alpn=${alpn}&sni=${DOMAIN}#${name}"
       ;;
     trojan)
       name="${DOMAIN}-Trojan-${id:0:8}"
