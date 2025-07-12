@@ -285,9 +285,11 @@ log_info "DNS validation successful!"
 
 log_info "--- Storing Initial Users in PostgreSQL ---"
 export PGPASSWORD=$PG_PASSWORD
+sudo -i -u postgres bash <<'EOF'
 psql -h localhost -U "$PG_USER" -d "$PG_DB_NAME" -c "INSERT INTO xray_users (type, user_id) VALUES ('vless', '$UUID_VLESS');"
 psql -h localhost -U "$PG_USER" -d "$PG_DB_NAME" -c "INSERT INTO xray_users (type, user_id) VALUES ('trojan', '$PASSWORD_TROJAN');"
 psql -h localhost -U "$PG_USER" -d "$PG_DB_NAME" -c "INSERT INTO hysteria_users (password) VALUES ('$PASSWORD_HYSTERIA');"
+EOF
 unset PGPASSWORD
 log_info "Initial VLESS, Trojan, and Hysteria users saved to the database."
 
@@ -610,7 +612,7 @@ EOF
 log_info "--- Installing Hysteria2 ---"
 RAW_TAG=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r .tag_name)
 ENC_TAG=${RAW_TAG//\//%2F}
-wget -nv -O "$HYSTERIA_BIN" "https://github.com/apernet/hysteria/releases/download/${ENC_TAG}/hysteria-linux-amd64-musl"
+wget -nv -O "$HYSTERIA_BIN" "https://github.com/apernet/hysteria/releases/download/${ENC_TAG}/hysteria-linux-amd64"
 chmod +x "$HYSTERIA_BIN"; log_info "Hysteria2 installed successfully!"
 
 cat > "$HYSTERIA_CONFIG" <<EOF
