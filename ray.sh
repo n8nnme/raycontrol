@@ -121,7 +121,7 @@ fi
 
 log_info "--- Installing Core Dependencies ---"
 apt-get update
-apt-get install -y curl wget unzip jq nftables certbot qrencode python3-certbot-dns-cloudflare uuid-runtime openssl socat gawk dnsutils bc coreutils watch postgresql postgresql-client
+apt-get install -y curl wget unzip jq nftables certbot qrencode python3-certbot-dns-cloudflare uuid-runtime openssl socat gawk dnsutils bc coreutils watch postgresql postgresql-client bsdmainutils
 
 read -rp "Domain (e.g. your.domain.com): " DOMAIN
 read -rp "Cloudflare API Token: " CF_API_TOKEN
