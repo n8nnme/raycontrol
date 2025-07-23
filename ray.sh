@@ -119,42 +119,22 @@ if [[ $EUID -ne 0 ]]; then
   log_error "This script must be run as root."; exit 1
 fi
 
+log_info "--- Installing Core Dependencies ---"
+apt-get update
+apt-get install -y curl wget unzip jq nftables certbot qrencode python3-certbot-dns-cloudflare uuid-runtime openssl socat gawk dnsutils bc coreutils watch postgresql postgresql-client
+
 read -rp "Domain (e.g. your.domain.com): " DOMAIN
 read -rp "Cloudflare API Token: " CF_API_TOKEN
 read -rp "Let’s Encrypt email: " EMAIL
 
-#!/usr/bin/env bash
-
-# It's good practice to set your variables at the top
-# or ensure they are properly sourced from a file.
-# For example:
-# source /path/to/your/config.file
-
 log_info "--- Verifying Cloudflare API Token ---"
-
-# Add --fail to curl to make it exit with an error on HTTP failure
-CF_ZONE_ID_RESPONSE=$(curl --fail -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN" \
+CF_ZONE_ID_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN" \
   -H "Authorization: Bearer $CF_API_TOKEN" \
   -H "Content-Type: application/json")
-
-# Check curl's exit code first
-if [ $? -ne 0 ]; then
-    log_error "curl command failed. Check network or Cloudflare API status."
-    exit 1
-fi
-
-# Now, check if the API call was successful
 if ! echo "$CF_ZONE_ID_RESPONSE" | jq -e '.success' &>/dev/null; then
-    # Attempt to get a specific error, otherwise show the whole response
-    ERROR_MSG=$(echo "$CF_ZONE_ID_RESPONSE" | jq -r '.errors[0].message // "No .errors array in response"')
-    if [[ "$ERROR_MSG" == "No .errors array in response" ]]; then
-        log_error "Cloudflare API error. Full response: $CF_ZONE_ID_RESPONSE"
-    else
-        log_error "Cloudflare API token is invalid or lacks 'Zone.Read' permissions. API response: $ERROR_MSG"
-    fi
-    exit 1
+    ERROR_MSG=$(echo "$CF_ZONE_ID_RESPONSE" | jq -r '.errors[0].message' 2>/dev/null || echo "Unknown error")
+    log_error "Cloudflare API token is invalid or lacks 'Zone.Read' permissions. API response: $ERROR_MSG"; exit 1
 fi
-
 log_info "Cloudflare API Token appears to be valid."
 
 echo
@@ -198,10 +178,6 @@ echo -e "${YELLOW}----------------------------${NC}\n"
 
 read -rp "Proceed with installation? [y/N]: " CONFIRM
 if [[ "${CONFIRM,,}" != "y" ]]; then echo "Installation cancelled."; trap - ERR; exit 0; fi
-
-log_info "--- Installing Core Dependencies ---"
-apt-get update
-apt-get install -y curl wget unzip jq nftables certbot qrencode python3-certbot-dns-cloudflare uuid-runtime openssl socat gawk dnsutils bc coreutils watch postgresql postgresql-client
 
 mkdir -p "$RAY_AIO_DIR" "/var/backups/ray-aio" "$SECRETS_DIR" "$HYSTERIA_DIR"
 
