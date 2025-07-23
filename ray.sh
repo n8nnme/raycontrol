@@ -123,14 +123,38 @@ read -rp "Domain (e.g. your.domain.com): " DOMAIN
 read -rp "Cloudflare API Token: " CF_API_TOKEN
 read -rp "Let’s Encrypt email: " EMAIL
 
+#!/usr/bin/env bash
+
+# It's good practice to set your variables at the top
+# or ensure they are properly sourced from a file.
+# For example:
+# source /path/to/your/config.file
+
 log_info "--- Verifying Cloudflare API Token ---"
-CF_ZONE_ID_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN" \
+
+# Add --fail to curl to make it exit with an error on HTTP failure
+CF_ZONE_ID_RESPONSE=$(curl --fail -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$DOMAIN" \
   -H "Authorization: Bearer $CF_API_TOKEN" \
   -H "Content-Type: application/json")
-if ! echo "$CF_ZONE_ID_RESPONSE" | jq -e '.success' &>/dev/null; then
-    ERROR_MSG=$(echo "$CF_ZONE_ID_RESPONSE" | jq -r '.errors[0].message' 2>/dev/null || echo "Unknown error")
-    log_error "Cloudflare API token is invalid or lacks 'Zone.Read' permissions. API response: $ERROR_MSG"; exit 1
+
+# Check curl's exit code first
+if [ $? -ne 0 ]; then
+    log_error "curl command failed. Check network or Cloudflare API status."
+    exit 1
 fi
+
+# Now, check if the API call was successful
+if ! echo "$CF_ZONE_ID_RESPONSE" | jq -e '.success' &>/dev/null; then
+    # Attempt to get a specific error, otherwise show the whole response
+    ERROR_MSG=$(echo "$CF_ZONE_ID_RESPONSE" | jq -r '.errors[0].message // "No .errors array in response"')
+    if [[ "$ERROR_MSG" == "No .errors array in response" ]]; then
+        log_error "Cloudflare API error. Full response: $CF_ZONE_ID_RESPONSE"
+    else
+        log_error "Cloudflare API token is invalid or lacks 'Zone.Read' permissions. API response: $ERROR_MSG"
+    fi
+    exit 1
+fi
+
 log_info "Cloudflare API Token appears to be valid."
 
 echo
