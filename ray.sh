@@ -281,7 +281,7 @@ PASSWORD_HYSTERIA=$(head -c32 /dev/urandom | base64 | tr '+/' '_-'); PASSWORD_HY
 echo "PASSWORD_HYSTERIA_OBFS=\"$PASSWORD_HYSTERIA_OBFS\"" >> "$INSTALL_CONF"
 
 log_info "--- Validating DNS Records ---"
-SERVER_IP=$(curl -s https://ipwho.de/ip); if [[ -z "$SERVER_IP" ]]; then log_error "Could not determine server's public IP address."; exit 1; fi
+SERVER_IP=$(curl -s https://4.ipwho.de/ip); if [[ -z "$SERVER_IP" ]]; then log_error "Could not determine server's public IP address."; exit 1; fi
 log_info "This server's public IP is: $SERVER_IP"; log_warn "Please ensure you have an A record for $DOMAIN pointing to this IP in your Cloudflare DNS."
 log_warn "Waiting 30 seconds for DNS to propagate..."; for i in {30..1}; do printf "\rWaiting... %2d" "$i"; sleep 1; done; echo -e "\rDone waiting. Now checking DNS resolution."
 RESOLVED_IP=$(dig +short "$DOMAIN" @1.1.1.1 || echo ""); log_info "Resolved IP for $DOMAIN is: ${RESOLVED_IP:-Not found}"
