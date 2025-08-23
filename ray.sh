@@ -119,6 +119,10 @@ if [[ $EUID -ne 0 ]]; then
   log_error "This script must be run as root."; exit 1
 fi
 
+log_info "--- Installing Core Dependencies ---"
+apt-get update
+apt-get install -y curl wget unzip jq nftables certbot qrencode python3-certbot-dns-cloudflare uuid-runtime openssl socat gawk dnsutils bc coreutils watch postgresql postgresql-client bsdmainutils
+
 read -rp "Domain (e.g. your.domain.com): " DOMAIN
 read -rp "Cloudflare API Token: " CF_API_TOKEN
 read -rp "Let’s Encrypt email: " EMAIL
@@ -174,10 +178,6 @@ echo -e "${YELLOW}----------------------------${NC}\n"
 
 read -rp "Proceed with installation? [y/N]: " CONFIRM
 if [[ "${CONFIRM,,}" != "y" ]]; then echo "Installation cancelled."; trap - ERR; exit 0; fi
-
-log_info "--- Installing Core Dependencies ---"
-apt-get update
-apt-get install -y curl wget unzip jq nftables certbot qrencode python3-certbot-dns-cloudflare uuid-runtime openssl socat gawk dnsutils bc coreutils watch postgresql postgresql-client
 
 mkdir -p "$RAY_AIO_DIR" "/var/backups/ray-aio" "$SECRETS_DIR" "$HYSTERIA_DIR"
 
@@ -281,7 +281,7 @@ PASSWORD_HYSTERIA=$(head -c32 /dev/urandom | base64 | tr '+/' '_-'); PASSWORD_HY
 echo "PASSWORD_HYSTERIA_OBFS=\"$PASSWORD_HYSTERIA_OBFS\"" >> "$INSTALL_CONF"
 
 log_info "--- Validating DNS Records ---"
-SERVER_IP=$(curl -s https://ipwho.de/ip); if [[ -z "$SERVER_IP" ]]; then log_error "Could not determine server's public IP address."; exit 1; fi
+SERVER_IP=$(curl -s https://4.ipwho.de/ip); if [[ -z "$SERVER_IP" ]]; then log_error "Could not determine server's public IP address."; exit 1; fi
 log_info "This server's public IP is: $SERVER_IP"; log_warn "Please ensure you have an A record for $DOMAIN pointing to this IP in your Cloudflare DNS."
 log_warn "Waiting 30 seconds for DNS to propagate..."; for i in {30..1}; do printf "\rWaiting... %2d" "$i"; sleep 1; done; echo -e "\rDone waiting. Now checking DNS resolution."
 RESOLVED_IP=$(dig +short "$DOMAIN" @1.1.1.1 || echo ""); log_info "Resolved IP for $DOMAIN is: ${RESOLVED_IP:-Not found}"
