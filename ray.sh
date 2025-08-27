@@ -771,17 +771,15 @@ log_info "--- Installing Xray-core ---"
 mkdir -p "$XRAY_DIR" "$XRAY_LOG_DIR"; chown -R nobody:nogroup "$XRAY_DIR" "$XRAY_LOG_DIR"
 wget -qO "${TEMP_ZIP}" "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VER}/Xray-linux-64.zip"
 wget -qO "${TEMP_DGST}" "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VER}/Xray-linux-64.zip.dgst"
-XRAY_HASH=$(awk '{print $2}' "${TEMP_DGST}")
-CHECKSUM_LINE="${XRAY_HASH}  ${TEMP_ZIP}"
-echo "$CHECKSUM_LINE" | sha256sum -c --status
-if [[ $? -eq 0 ]]; then
+XRAY_HASH=$(sed -e 's/^sha256://' "${TEMP_DGST}")
+if echo "${XRAY_HASH}  ${TEMP_ZIP}" | sha256sum -c --status; then
     log_info "Checksum OK: xray"
 else
     log_error "ERROR: checksum mismatch - xray"
-    echo "$CHECKSUM_LINE" | sha256sum -c
+    echo "${XRAY_HASH}  ${TEMP_ZIP}" | sha256sum -c
     exit 1
 fi
-unzip -qo "${TEMP_ZIP}" -d "/usr/local/bin"
+unzip -qo "${TEMP_ZIP}" -d "$(dirname "$XRAY_BIN")"
 chmod +x "$XRAY_BIN"
 
 cat > "$XRAY_CONFIG_TPL" <<EOF
