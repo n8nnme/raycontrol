@@ -35,8 +35,25 @@ CLOUDFLARE_INI="$SECRETS_DIR/cloudflare.ini"
 DB_CONF="$SECRETS_DIR/db.conf"
 LE_POST_HOOK_DIR="/etc/letsencrypt/renewal-hooks/post"
 LE_POST_HOOK_SCRIPT="$LE_POST_HOOK_DIR/reload_services.sh"
-TEMP_ZIP="/tmp/Xray-linux-64.zip"
-TEMP_AWK="/tmp/check_x86_v_level.awk"
+TMP_DIR="$(mktemp -d)"
+TEMP_ZIP="${TMP_DIR}/Xray-linux-64.zip"
+TEMP_AWK="${TMP_DIR}/check_x86_v_level.awk"
+ORIG_DIR="$PWD"
+TEMP_DGST="${TMP_DIR}/Xray-linux-64.zip.dgst"
+XRAY_HASH=$(sed -e 's/^sha256://g' "${TEMP_DGST}")
+
+# --- Configuration: urls ---
+
+# hysteria2
+RAW_TAG=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r .tag_name)
+ENC_TAG=${RAW_TAG//\//%2F}
+HYSTERIA_URL_BIN="https://github.com/aparnet/hysteria/releases/download/${ENC_TAG}/hysteria-linux-amd64"
+HYSTERIA_URL_HASHES="https://github.com/aparnet/hysteria/releases/download/${ENC_TAG}/hashes.txt"
+
+# xray
+XRAY_VER=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+
+
 
 # --- Configuration: Colors ---
 GREEN='\033[0;32m'
@@ -118,6 +135,8 @@ validate_port() {
 if [[ $EUID -ne 0 ]]; then
   log_error "This script must be run as root."; exit 1
 fi
+
+cd "${TMP_DIR}"
 
 log_info "--- Installing Core Dependencies ---"
 apt-get update
@@ -219,14 +238,11 @@ chmod 600 "$HYSTERIA_DB_CONF"
 
 systemctl enable --now postgresql
 
-ORIG_DIR="$PWD"
-cd /tmp
 sudo -u postgres psql -c "CREATE DATABASE \"$PG_DB_NAME\";"
 sudo -u postgres psql -c "CREATE USER \"$PG_USER\" WITH PASSWORD '$PG_PASSWORD';"
 sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"$PG_DB_NAME\" TO \"$PG_USER\";"
 sudo -u postgres psql -d "$PG_DB_NAME" -c \
   "GRANT USAGE, CREATE ON SCHEMA public TO \"$PG_USER\";"
-cd "$ORIG_DIR"
 export PGPASSWORD=$PG_PASSWORD
 psql -h localhost -U "$PG_USER" -d "$PG_DB_NAME" -c "
   CREATE TABLE xray_users (
@@ -731,9 +747,21 @@ chmod +x "$LE_POST_HOOK_SCRIPT"
 
 log_info "--- Installing Xray-core ---"
 mkdir -p "$XRAY_DIR" "$XRAY_LOG_DIR"; chown -R nobody:nogroup "$XRAY_DIR" "$XRAY_LOG_DIR"
-XRAY_VER=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
-wget -qO "$TEMP_ZIP" "https://github.com/XTLS/Xray-core/releases/download/$XRAY_VER/Xray-linux-64.zip"
-unzip -qo "$TEMP_ZIP" -d /usr/local/bin; rm "$TEMP_ZIP"; chmod +x "$XRAY_BIN"
+wget -qO "${TEMP_ZIP}" "https://github.com/${REPO}/releases/download/${XRAY_VER}/Xray-linux-64.zip"
+wget -qO "${TEMP_DGST}" "https://github.com/${REPO}/releases/download/${XRAY_VER}/Xray-linux-64.zip.dgst"
+echo "${XRAY_HASH}  ${TEMP_ZIP}" | sha256sum -c --status
+if [[ $? -eq 0 ]]; then
+    log_info "Checksum OK: xray"
+else
+    log_info "ERROR: checksum mismatch - xray"
+    echo "${XRAY_HASH}  ${TEMP_ZIP}" | sha256sum -c
+    exit 1
+    
+fi
+unzip -qo "${TEMP_ZIP}" -d "${BIN_DIR}"
+chmod +x "${BIN_DIR}/${XRAY_BIN##*/}"
+
+
 
 cat > "$XRAY_CONFIG_TPL" <<EOF
 {
@@ -778,10 +806,16 @@ WantedBy=multi-user.target
 EOF
 
 log_info "--- Installing Hysteria2 ---"
-RAW_TAG=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r .tag_name)
-ENC_TAG=${RAW_TAG//\//%2F}
-wget -nv -O "$HYSTERIA_BIN" "https://github.com/apernet/hysteria/releases/download/${ENC_TAG}/hysteria-linux-amd64"
-chmod +x "$HYSTERIA_BIN"; log_info "Hysteria2 installed successfully!"
+wget -q -O hysteria-linux-amd64 "${URL_BIN}"
+wget -q -O hashes.txt "${URL_HASHES}"
+if grep -F "hysteria-linux-amd64" hashes.txt | sha256sum -c --status; then
+    log_info "Checksum OK: hystera2"
+else
+    log_info "ERROR: Checksum mismatch - hysteria2"
+    grep -F "hysteria-linux-amd64" hashes.txt | sha256sum -c
+    exit 1
+fi
+install -m 0755 hysteria-linux-amd64 "${HYSTERIA_BIN}"; log_info "Hysteria2 installed successfully!"
 
 cat > "$HYSTERIA_CONFIG" <<EOF
 listen: :$PORT_HYSTERIA
@@ -887,3 +921,7 @@ else
 fi
 echo -e "\nUse ${GREEN}'$RAYCONTROL_PATH help'${NC} for a full list of commands."
 echo -e "\n${GREEN}=========================================================================================${NC}\n"
+
+
+cd "$ORIG_DIR"
+rm -rf "${TMP_DIR}"
