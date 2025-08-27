@@ -764,8 +764,8 @@ chmod +x "$LE_POST_HOOK_SCRIPT"
 
 log_info "--- Installing Xray-core ---"
 mkdir -p "$XRAY_DIR" "$XRAY_LOG_DIR"; chown -R nobody:nogroup "$XRAY_DIR" "$XRAY_LOG_DIR"
-wget -qO "${TEMP_ZIP}" "https://github.com/${REPO}/releases/download/${XRAY_VER}/Xray-linux-64.zip"
-wget -qO "${TEMP_DGST}" "https://github.com/${REPO}/releases/download/${XRAY_VER}/Xray-linux-64.zip.dgst"
+wget -qO "${TEMP_ZIP}" "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VER}/Xray-linux-64.zip"
+wget -qO "${TEMP_DGST}" "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VER}/Xray-linux-64.zip.dgst"
 XRAY_HASH=$(sed -e 's/^sha256://g' "${TEMP_DGST}")
 echo "${XRAY_HASH}  ${TEMP_ZIP}" | sha256sum -c --status
 if [[ $? -eq 0 ]]; then
