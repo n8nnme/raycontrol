@@ -120,6 +120,8 @@ cleanup() {
     log_warn "Removing temporary files..."
     rm -f "$TEMP_AWK" "$TEMP_ZIP" "$RAYCONTROL_PATH"
 
+    cd "$ORIG_DIR"
+    rm -rf "${TMP_DIR}"
     log_warn "Rollback complete. The system may require manual cleanup."
     exit 1
 }
