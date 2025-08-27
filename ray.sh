@@ -837,7 +837,7 @@ for f in hysteria-linux-amd64 hashes.txt; do
   [[ -s "$f" ]] || { log_error "$f is empty or missing"; exit 1; }
 done
 
-grep -F "hysteria-linux-amd64" hashes.txt | sed 's|build/||' > chk.txt
+grep -E 'hysteria-linux-amd64$' hashes.txt | sed 's|build/||' > chk.txt
 
 if sha256sum -c chk.txt --status; then
     log_info "Checksum OK: hysteria2"
