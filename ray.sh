@@ -104,7 +104,7 @@ cleanup() {
            sudo -u postgres psql -c "DROP USER IF EXISTS \"$PG_USER\";" &>/dev/null
         fi
         log_warn "Purging PostgreSQL packages..."
-        apt-get purge -y --auto-remove postgresql* &>/dev/null
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y --auto-remove postgresql* &>/dev/null
     fi
 
     systemctl daemon-reload
@@ -114,7 +114,7 @@ cleanup() {
 
     if [[ -n "${XANMOD_PKG_NAME_INSTALLED:-}" ]]; then
         log_warn "Uninstalling XanMod Kernel package: ${XANMOD_PKG_NAME_INSTALLED}"
-        apt-get remove -y "$XANMOD_PKG_NAME_INSTALLED"
+        DEBIAN_FRONTEND=noninteractive apt-get remove -y "$XANMOD_PKG_NAME_INSTALLED"
     fi
 
     log_warn "Removing temporary files..."
@@ -139,7 +139,7 @@ cd "${TMP_DIR}"
 
 log_info "--- Installing Core Dependencies ---"
 apt-get update
-apt-get install -y curl wget unzip jq nftables certbot qrencode python3-certbot-dns-cloudflare uuid-runtime openssl socat gawk dnsutils bc coreutils watch postgresql postgresql-client bsdmainutils
+DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget unzip jq nftables certbot qrencode python3-certbot-dns-cloudflare uuid-runtime openssl socat gawk dnsutils bc coreutils watch postgresql postgresql-client bsdmainutils
 
 read -rp "Domain (e.g. your.domain.com): " DOMAIN
 read -rp "Cloudflare API Token: " CF_API_TOKEN
@@ -267,7 +267,7 @@ log_info "PostgreSQL is configured for local network connections only by default
 
 if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
     log_info "--- Setting up XanMod Repository ---"
-    apt-get install -y gpg
+    DEBIAN_FRONTEND=noninteractive apt-get install -y gpg
     echo 'deb http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-kernel.list
     wget -qO - https://dl.xanmod.org/gpg.key | gpg --dearmor -o /etc/apt/trusted.gpg.d/xanmod-kernel.gpg
     log_info "--- Updating sources for XanMod ---"; apt-get update
@@ -293,7 +293,7 @@ AWK
         *) XANMOD_PKG_NAME="linux-xanmod-lts-x64v1" ;;
     esac
     log_info "--- Installing XanMod Kernel ($XANMOD_PKG_NAME) ---"
-    apt-get install -y "$XANMOD_PKG_NAME"; XANMOD_PKG_NAME_INSTALLED=$XANMOD_PKG_NAME
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$XANMOD_PKG_NAME"; XANMOD_PKG_NAME_INSTALLED=$XANMOD_PKG_NAME
 fi
 
 UUID_VLESS=$(uuidgen); PASSWORD_TROJAN=$(head -c16 /dev/urandom | base64 | tr '+/' '_-' | cut -c1-16)
