@@ -36,11 +36,8 @@ DB_CONF="$SECRETS_DIR/db.conf"
 LE_POST_HOOK_DIR="/etc/letsencrypt/renewal-hooks/post"
 LE_POST_HOOK_SCRIPT="$LE_POST_HOOK_DIR/reload_services.sh"
 TMP_DIR="$(mktemp -d)"
-TEMP_ZIP="${TMP_DIR}/Xray-linux-64.zip"
 TEMP_AWK="${TMP_DIR}/check_x86_v_level.awk"
 ORIG_DIR="$PWD"
-TEMP_DGST="${TMP_DIR}/Xray-linux-64.zip.dgst"
-XRAY_HASH=$(sed -e 's/^sha256://g' "${TEMP_DGST}")
 
 # --- Configuration: urls ---
 
@@ -52,6 +49,9 @@ HYSTERIA_URL_HASHES="https://github.com/aparnet/hysteria/releases/download/${ENC
 
 # xray
 XRAY_VER=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+TEMP_ZIP="${TMP_DIR}/Xray-linux-64.zip"
+TEMP_DGST="${TMP_DIR}/Xray-linux-64.zip.dgst"
+XRAY_HASH=$(sed -e 's/^sha256://g' "${TEMP_DGST}")
 
 
 
