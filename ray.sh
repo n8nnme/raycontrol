@@ -771,12 +771,14 @@ log_info "--- Installing Xray-core ---"
 mkdir -p "$XRAY_DIR" "$XRAY_LOG_DIR"; chown -R nobody:nogroup "$XRAY_DIR" "$XRAY_LOG_DIR"
 wget -qO "${TEMP_ZIP}" "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VER}/Xray-linux-64.zip"
 wget -qO "${TEMP_DGST}" "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VER}/Xray-linux-64.zip.dgst"
-XRAY_HASH=$(sed -e 's/^sha256://' "${TEMP_DGST}")
-if echo "${XRAY_HASH}  ${TEMP_ZIP}" | sha256sum -c --status; then
+XRAY_HASH=$(grep '^SHA2-256=' "${TEMP_DGST}" | cut -d'=' -f2)
+CALC_HASH=$(sha256sum "${TEMP_ZIP}" | awk '{print $1}')
+if [[ "${CALC_HASH,,}" == "${XRAY_HASH,,}" ]]; then
     log_info "Checksum OK: xray"
 else
     log_error "ERROR: checksum mismatch - xray"
-    echo "${XRAY_HASH}  ${TEMP_ZIP}" | sha256sum -c
+    echo "Expected: ${XRAY_HASH}"
+    echo "Actual:   ${CALC_HASH}"
     exit 1
 fi
 unzip -qo "${TEMP_ZIP}" -d "$(dirname "$XRAY_BIN")"
