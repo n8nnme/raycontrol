@@ -237,6 +237,11 @@ chmod 600 "$HYSTERIA_DB_CONF"
 
 systemctl enable --now postgresql
 
+if sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "$PG_DB_NAME"; then
+    log_warn "Database '$PG_DB_NAME' already exists. Dropping it..."
+    sudo -u postgres psql -c "DROP DATABASE \"$PG_DB_NAME\";"
+fi
+
 sudo -u postgres psql -c "CREATE DATABASE \"$PG_DB_NAME\";"
 sudo -u postgres psql -c "CREATE USER \"$PG_USER\" WITH PASSWORD '$PG_PASSWORD';"
 sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"$PG_DB_NAME\" TO \"$PG_USER\";"
