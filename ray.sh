@@ -51,7 +51,6 @@ HYSTERIA_URL_HASHES="https://github.com/aparnet/hysteria/releases/download/${ENC
 XRAY_VER=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
 TEMP_ZIP="${TMP_DIR}/Xray-linux-64.zip"
 TEMP_DGST="${TMP_DIR}/Xray-linux-64.zip.dgst"
-XRAY_HASH=$(sed -e 's/^sha256://g' "${TEMP_DGST}")
 
 
 
@@ -767,6 +766,7 @@ log_info "--- Installing Xray-core ---"
 mkdir -p "$XRAY_DIR" "$XRAY_LOG_DIR"; chown -R nobody:nogroup "$XRAY_DIR" "$XRAY_LOG_DIR"
 wget -qO "${TEMP_ZIP}" "https://github.com/${REPO}/releases/download/${XRAY_VER}/Xray-linux-64.zip"
 wget -qO "${TEMP_DGST}" "https://github.com/${REPO}/releases/download/${XRAY_VER}/Xray-linux-64.zip.dgst"
+XRAY_HASH=$(sed -e 's/^sha256://g' "${TEMP_DGST}")
 echo "${XRAY_HASH}  ${TEMP_ZIP}" | sha256sum -c --status
 if [[ $? -eq 0 ]]; then
     log_info "Checksum OK: xray"
