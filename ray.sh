@@ -771,20 +771,18 @@ log_info "--- Installing Xray-core ---"
 mkdir -p "$XRAY_DIR" "$XRAY_LOG_DIR"; chown -R nobody:nogroup "$XRAY_DIR" "$XRAY_LOG_DIR"
 wget -qO "${TEMP_ZIP}" "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VER}/Xray-linux-64.zip"
 wget -qO "${TEMP_DGST}" "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VER}/Xray-linux-64.zip.dgst"
-XRAY_HASH=$(sed -e 's/^sha256://g' "${TEMP_DGST}")
-echo "${XRAY_HASH}  ${TEMP_ZIP}" | sha256sum -c --status
+XRAY_HASH=$(awk '{print $2}' "${TEMP_DGST}")
+CHECKSUM_LINE="${XRAY_HASH}  ${TEMP_ZIP}"
+echo "$CHECKSUM_LINE" | sha256sum -c --status
 if [[ $? -eq 0 ]]; then
     log_info "Checksum OK: xray"
 else
-    log_info "ERROR: checksum mismatch - xray"
-    echo "${XRAY_HASH}  ${TEMP_ZIP}" | sha256sum -c
+    log_error "ERROR: checksum mismatch - xray"
+    echo "$CHECKSUM_LINE" | sha256sum -c
     exit 1
-    
 fi
-unzip -qo "${TEMP_ZIP}" -d "${BIN_DIR}"
-chmod +x "${BIN_DIR}/${XRAY_BIN##*/}"
-
-
+unzip -qo "${TEMP_ZIP}" -d "/usr/local/bin"
+chmod +x "$XRAY_BIN"
 
 cat > "$XRAY_CONFIG_TPL" <<EOF
 {
@@ -829,12 +827,12 @@ WantedBy=multi-user.target
 EOF
 
 log_info "--- Installing Hysteria2 ---"
-wget -q -O hysteria-linux-amd64 "${URL_BIN}"
-wget -q -O hashes.txt "${URL_HASHES}"
+wget -q -O hysteria-linux-amd64 "${HYSTERIA_URL_BIN}"
+wget -q -O hashes.txt "${HYSTERIA_URL_HASHES}"
 if grep -F "hysteria-linux-amd64" hashes.txt | sha256sum -c --status; then
     log_info "Checksum OK: hystera2"
 else
-    log_info "ERROR: Checksum mismatch - hysteria2"
+    log_error "ERROR: Checksum mismatch - hysteria2"
     grep -F "hysteria-linux-amd64" hashes.txt | sha256sum -c
     exit 1
 fi
