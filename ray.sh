@@ -827,16 +827,24 @@ WantedBy=multi-user.target
 EOF
 
 log_info "--- Installing Hysteria2 ---"
-wget -q -O hysteria-linux-amd64 "${HYSTERIA_URL_BIN}"
-wget -q -O hashes.txt "${HYSTERIA_URL_HASHES}"
+
+wget -q -O hysteria-linux-amd64 "${HYSTERIA_URL_BIN}" || { log_error "Failed to download binary"; exit 1; }
+wget -q -O hashes.txt           "${HYSTERIA_URL_HASHES}" || { log_error "Failed to download hashes.txt"; exit 1; }
+
+for f in hysteria-linux-amd64 hashes.txt; do
+  [[ -s "$f" ]] || { log_error "$f is empty or missing"; exit 1; }
+done
+
 if grep -F "hysteria-linux-amd64" hashes.txt | sha256sum -c --status; then
-    log_info "Checksum OK: hystera2"
+    log_info "Checksum OK: hysteria2"
 else
     log_error "ERROR: Checksum mismatch - hysteria2"
-    grep -F "hysteria-linux-amd64" hashes.txt | sha256sum -c
+    grep -F "hysteria-linux-amd64" hashes.txt | sha256sum -c || true
     exit 1
 fi
-install -m 0755 hysteria-linux-amd64 "${HYSTERIA_BIN}"; log_info "Hysteria2 installed successfully!"
+
+install -m 0755 hysteria-linux-amd64 "${HYSTERIA_BIN}"
+log_info "Hysteria2 installed successfully!"
 
 cat > "$HYSTERIA_CONFIG" <<EOF
 listen: :$PORT_HYSTERIA
