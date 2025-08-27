@@ -44,8 +44,8 @@ ORIG_DIR="$PWD"
 # hysteria2
 RAW_TAG=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r .tag_name)
 ENC_TAG=${RAW_TAG//\//%2F}
-HYSTERIA_URL_BIN="https://github.com/aparnet/hysteria/releases/download/${ENC_TAG}/hysteria-linux-amd64"
-HYSTERIA_URL_HASHES="https://github.com/aparnet/hysteria/releases/download/${ENC_TAG}/hashes.txt"
+HYSTERIA_URL_BIN="https://github.com/apernet/hysteria/releases/download/${ENC_TAG}/hysteria-linux-amd64"
+HYSTERIA_URL_HASHES="https://github.com/apernet/hysteria/releases/download/${ENC_TAG}/hashes.txt"
 
 # xray
 XRAY_VER=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
