@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 set -uo pipefail
 
 GREEN='\033[0;32m'
@@ -19,6 +20,7 @@ remove_file_if_exists() {
         echo "Not found (OK): $file_path"
     fi
 }
+
 remove_dir_if_exists() { remove_file_if_exists "$1"; }
 
 if [[ $EUID -ne 0 ]]; then
@@ -27,13 +29,14 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 step "Ray-AIO Smart Uninstaller"
+
 cat <<-EOF
 This script will:
-  1) Disable & stop Ray-AIO services and PostgreSQL
-  2) Flush firewall rules
-  3) Drop the PostgreSQL database and user
-  4) Remove certificates & configuration files
-  5) (Optionally) Remove dependencies and the XanMod kernel
+1) Disable & stop Ray-AIO services and PostgreSQL
+2) Flush firewall rules
+3) Drop the PostgreSQL database and user
+4) Remove certificates & configuration files
+5) (Optionally) Remove dependencies and the XanMod kernel
 EOF
 
 read -rp "Proceed with uninstallation? [y/N]: " CONFIRM
@@ -64,7 +67,7 @@ for svc in xray hysteria-server postgresql; do
 done
 
 step "Flushing Firewall Rules"
-if command -v nft &>/dev/null; then
+if command -v nft >/dev/null; then
     nft flush ruleset || true
     nft -s list ruleset > /etc/nftables.conf || true
     echo "Cleared NFTables rules; saved empty config."
@@ -86,7 +89,7 @@ fi
 if [[ -n "${PG_DB_NAME:-}" && -n "${PG_USER:-}" ]]; then
     echo "Dropping database '$PG_DB_NAME' and user '$PG_USER'..."
     sudo -u postgres psql -c "DROP DATABASE IF EXISTS \"${PG_DB_NAME}\";" || true
-    sudo -u postgres psql -c "DROP USER IF EXISTS \"${PG_USER}\";"       || true
+    sudo -u postgres psql -c "DROP USER IF EXISTS \"${PG_USER}\";" || true
     echo "PostgreSQL cleanup complete."
 else
     echo "PostgreSQL config not found or DB name/user variables not set; skipping database drop."
@@ -100,8 +103,8 @@ remove_file_if_exists "/etc/systemd/system/hysteria-server.service"
 systemctl daemon-reload || true
 
 step "Removing Let's Encrypt Certificate"
-if [[ -n "${DOMAIN}" ]] && command -v certbot &>/dev/null; then
-    if certbot certificates --cert-name "$DOMAIN" &>/dev/null; then
+if [[ -n "${DOMAIN}" ]] && command -v certbot >/dev/null; then
+    if certbot certificates --cert-name "$DOMAIN" >/dev/null; then
         certbot delete --non-interactive --cert-name "$DOMAIN" || true
         echo "Deleted certificate for $DOMAIN."
     else
@@ -126,18 +129,21 @@ remove_dir_if_exists "/root/.secrets"
 remove_file_if_exists "/var/log/raycontrol.log"
 
 step "Phase 3: Removing Packages"
+
 CORE_DEPS=(
-  curl wget unzip jq nftables certbot qrencode
-  python3-certbot-dns-cloudflare uuid-runtime
-  socat gawk dnsutils bc bsdmainutils
-  postgresql postgresql-client postgresql-contrib
+    unzip jq nftables certbot qrencode
+    python3-certbot-dns-cloudflare uuid-runtime
+    socat gawk dnsutils bc bsdmainutils
+    postgresql postgresql-client postgresql-contrib
 )
+
 echo "The following packages were installed as dependencies:"
 echo -e "${YELLOW}${CORE_DEPS[*]}${NC}"
 echo "Removing these may affect other applications on the system."
 read -rp "Do you want to remove these packages? [y/N]: " RM_DEPS
 if [[ "${RM_DEPS,,}" == "y" ]]; then
     DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y "${CORE_DEPS[@]}" || true
+    DEBIAN_FRONTEND=noninteractive apt-get autoremove -y || true
     echo -e "${GREEN}Dependencies removed.${NC}"
 else
     echo "Skipped dependency removal."
