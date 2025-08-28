@@ -88,8 +88,38 @@ fi
 
 if [[ -n "${PG_DB_NAME:-}" && -n "${PG_USER:-}" ]]; then
     echo "Dropping database '$PG_DB_NAME' and user '$PG_USER'..."
-    sudo -u postgres psql -c "DROP DATABASE IF EXISTS \"${PG_DB_NAME}\";" || true
-    sudo -u postgres psql -c "DROP USER IF EXISTS \"${PG_USER}\";" || true
+    # Ensure PostgreSQL service is running to accept connections at drop time
+    systemctl is-active --quiet postgresql || {
+        echo "PostgreSQL not running, starting service temporarily..."
+        systemctl start postgresql || { echo "Failed to start PostgreSQL service."; exit 1; }
+        STOP_PG=true
+    }
+
+    # Retry dropping DB and user with timeout
+    for i in {1..5}; do
+        if sudo -u postgres psql -c "DROP DATABASE IF EXISTS \"$PG_DB_NAME\";"; then
+            break
+        else
+            echo "Failed to drop database, retrying in 2 seconds..."
+            sleep 2
+        fi
+    done
+
+    for i in {1..5}; do
+        if sudo -u postgres psql -c "DROP USER IF EXISTS \"$PG_USER\";"; then
+            break
+        else
+            echo "Failed to drop user, retrying in 2 seconds..."
+            sleep 2
+        fi
+    done
+
+    # If started PostgreSQL above, stop it now
+    if [[ $STOP_PG == true ]]; then
+        echo "Stopping PostgreSQL service started temporarily..."
+        systemctl stop postgresql || true
+    fi
+
     echo "PostgreSQL cleanup complete."
 else
     echo "PostgreSQL config not found or DB name/user variables not set; skipping database drop."
@@ -131,7 +161,7 @@ remove_file_if_exists "/var/log/raycontrol.log"
 step "Phase 3: Removing Packages"
 
 CORE_DEPS=(
-    unzip jq nftables certbot qrencode
+    curl wget unzip jq nftables certbot qrencode
     python3-certbot-dns-cloudflare uuid-runtime
     socat gawk dnsutils bc bsdmainutils
     postgresql postgresql-client postgresql-contrib
