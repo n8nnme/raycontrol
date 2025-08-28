@@ -711,7 +711,7 @@ esac
 EOF
 chmod +x "$RAYCONTROL_PATH"
 
-cat > "$APPLY_NFTABLES_SCRIPT" <<'EOF'
+cat > "$APPLY_NFTABLES_SCRIPT" <<'SCRIPT_EOF'
 #!/usr/bin/env bash
 set -e
 # shellcheck source=/dev/null
@@ -849,7 +849,7 @@ if [[ -n $IFACE ]]; then
     }
 NAT_EOF
 fi
-EOF
+SCRIPT_EOF
 chmod +x "$APPLY_NFTABLES_SCRIPT"
 
 log_info "--- Issuing Certificate with Certbot ---"
