@@ -707,89 +707,67 @@ esac
 EOF
 chmod +x "$RAYCONTROL_PATH"
 
-cat > "$APPLY_NFTABLES_SCRIPT" <<EOF
+cat > "$APPLY_NFTABLES_SCRIPT" <<'EOF'
 #!/usr/bin/env bash
 set -e
 # shellcheck source=/dev/null
 source /etc/ray-aio/install.conf
-
 nft flush ruleset
 nft add table inet filter
-
 nft add chain inet filter input  '{ type filter hook input  priority 0; policy drop; }'
-nft add chain inet filter forward '{ type filter hook forward priority 0; policy drop; }'  # comment: drop forwarding if not a router
+nft add chain inet filter forward '{ type filter hook forward priority 0; policy drop; }'
 nft add chain inet filter output  '{ type filter hook output priority 0; policy accept; }'
-
 nft add chain inet filter knock_stage1_handler
 nft add chain inet filter knock_stage2_handler
 nft add chain inet filter knock
-
-# IPv4 sets
 nft add set inet filter knock_stage1   '{ type ipv4_addr; flags dynamic; timeout 30s; size 65536; gc-interval 1m; }'
 nft add set inet filter knock_stage2   '{ type ipv4_addr; flags dynamic; timeout 30s; size 65536; gc-interval 1m; }'
 nft add set inet filter xray_clients   '{ type ipv4_addr; flags dynamic; timeout 10m; size 65536; gc-interval 5m; }'
-nft add set inet filter knock_fail     '{ type ipv4_addr; flags dynamic; timeout 10m; size 65536; gc-interval 5m; }'  # reduced ban timeout
-
-# IPv6 sets (duplicate for consistency)
+nft add set inet filter knock_fail     '{ type ipv4_addr; flags dynamic; timeout 10m; size 65536; gc-interval 5m; }'
 nft add set inet filter knock_stage1_v6 '{ type ipv6_addr; flags dynamic; timeout 30s; size 65536; gc-interval 1m; }'
 nft add set inet filter knock_stage2_v6 '{ type ipv6_addr; flags dynamic; timeout 30s; size 65536; gc-interval 1m; }'
 nft add set inet filter xray_clients_v6 '{ type ipv6_addr; flags dynamic; timeout 10m; size 65536; gc-interval 5m; }'
 nft add set inet filter knock_fail_v6  '{ type ipv6_addr; flags dynamic; timeout 10m; size 65536; gc-interval 5m; }'
-
-# Basic protections
-nft add rule inet filter input iif lo accept  # loopback
-nft add rule inet filter input ct state invalid log prefix "nft-invalid: " drop  # drop invalid states early
+nft add rule inet filter input iif lo accept
+nft add rule inet filter input ct state invalid log prefix "nft-invalid: " drop
 nft add rule inet filter input ip saddr @knock_fail log prefix "nft-banned-v4: " drop
 nft add rule inet filter input ip6 saddr @knock_fail_v6 log prefix "nft-banned-v6: " drop
-
-# Accept for whitelisted clients (IPv4 + IPv6)
 nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_VLESS counter update @xray_clients '{ ip saddr }' accept
 nft add rule inet filter input ip saddr @xray_clients tcp dport $PORT_TROJAN counter update @xray_clients '{ ip saddr }' accept
 nft add rule inet filter input ip saddr @xray_clients udp dport $PORT_HYSTERIA counter update @xray_clients '{ ip saddr }' accept
 nft add rule inet filter input ip saddr @xray_clients tcp dport $SSH_PORT counter update @xray_clients '{ ip saddr }' accept
 nft add rule inet filter input ip saddr @xray_clients ct state established,related accept
-nft add rule inet filter input ip saddr @xray_clients icmp type { echo-request, echo-reply } accept  # safe ICMP only
-
+nft add rule inet filter input ip saddr @xray_clients icmp type { echo-request, echo-reply } accept
 nft add rule inet filter input ip6 saddr @xray_clients_v6 tcp dport $PORT_VLESS counter update @xray_clients_v6 '{ ip6 saddr }' accept
 nft add rule inet filter input ip6 saddr @xray_clients_v6 tcp dport $PORT_TROJAN counter update @xray_clients_v6 '{ ip6 saddr }' accept
 nft add rule inet filter input ip6 saddr @xray_clients_v6 udp dport $PORT_HYSTERIA counter update @xray_clients_v6 '{ ip6 saddr }' accept
 nft add rule inet filter input ip6 saddr @xray_clients_v6 tcp dport $SSH_PORT counter update @xray_clients_v6 '{ ip6 saddr }' accept
 nft add rule inet filter input ip6 saddr @xray_clients_v6 ct state established,related accept
-nft add rule inet filter input ip6 saddr @xray_clients_v6 icmpv6 type { echo-request, echo-reply } accept  # safe ICMPv6
-
-# Knocking (IPv4 + IPv6, TCP/UDP for robustness)
-# Stage 1
+nft add rule inet filter input ip6 saddr @xray_clients_v6 icmpv6 type { echo-request, echo-reply } accept
 nft add rule inet filter input tcp dport $K1 limit rate 3/minute burst 5 jump knock_stage1_handler
-nft add rule inet filter input udp dport $K1 limit rate 3/minute burst 5 jump knock_stage1_handler  # UDP support
-nft add rule inet filter input ip protocol { tcp, udp } dport $K1 add @knock_fail '{ ip saddr }' log prefix "nft-knock-fail-v4: " drop  # ban only on flood/exceed
+nft add rule inet filter input udp dport $K1 limit rate 3/minute burst 5 jump knock_stage1_handler
+nft add rule inet filter input ip protocol { tcp, udp } dport $K1 add @knock_fail '{ ip saddr }' log prefix "nft-knock-fail-v4: " drop
 nft add rule inet filter input ip6 nexthdr { tcp, udp } dport $K1 add @knock_fail_v6 '{ ip6 saddr }' log prefix "nft-knock-fail-v6: " drop
-
 nft add rule inet filter knock_stage1_handler add @knock_stage1 '{ ip saddr }'
 nft add rule inet filter knock_stage1_handler add @knock_stage1_v6 '{ ip6 saddr }'
 nft add rule inet filter knock_stage1_handler drop
-
-# Stage 2
 nft add rule inet filter input tcp dport $K2 ip saddr @knock_stage1 limit rate 3/minute burst 5 jump knock_stage2_handler
 nft add rule inet filter input udp dport $K2 ip saddr @knock_stage1 limit rate 3/minute burst 5 jump knock_stage2_handler
 nft add rule inet filter input tcp dport $K2 ip6 saddr @knock_stage1_v6 limit rate 3/minute burst 5 jump knock_stage2_handler
 nft add rule inet filter input udp dport $K2 ip6 saddr @knock_stage1_v6 limit rate 3/minute burst 5 jump knock_stage2_handler
-nft add rule inet filter input ip protocol { tcp, udp } dport $K2 add @knock_fail '{ ip saddr }' log prefix "nft-knock-fail-v4: " drop  # ban on flood
+nft add rule inet filter input ip protocol { tcp, udp } dport $K2 add @knock_fail '{ ip saddr }' log prefix "nft-knock-fail-v4: " drop
 nft add rule inet filter input ip6 nexthdr { tcp, udp } dport $K2 add @knock_fail_v6 '{ ip6 saddr }' log prefix "nft-knock-fail-v6: " drop
-nft add rule inet filter input ip protocol { tcp, udp } dport $K2 drop  # silent drop for wrong sequence (no ban)
-
+nft add rule inet filter input ip protocol { tcp, udp } dport $K2 drop
 nft add rule inet filter knock_stage2_handler add @knock_stage2 '{ ip saddr }'
 nft add rule inet filter knock_stage2_handler add @knock_stage2_v6 '{ ip6 saddr }'
 nft add rule inet filter knock_stage2_handler drop
-
-# Stage 3
 nft add rule inet filter input tcp dport $K3 ip saddr @knock_stage2 limit rate 3/minute burst 5 jump knock
 nft add rule inet filter input udp dport $K3 ip saddr @knock_stage2 limit rate 3/minute burst 5 jump knock
 nft add rule inet filter input tcp dport $K3 ip6 saddr @knock_stage2_v6 limit rate 3/minute burst 5 jump knock
 nft add rule inet filter input udp dport $K3 ip6 saddr @knock_stage2_v6 limit rate 3/minute burst 5 jump knock
 nft add rule inet filter input ip protocol { tcp, udp } dport $K3 add @knock_fail '{ ip saddr }' log prefix "nft-knock-fail-v4: " drop
 nft add rule inet filter input ip6 nexthdr { tcp, udp } dport $K3 add @knock_fail_v6 '{ ip6 saddr }' log prefix "nft-knock-fail-v6: " drop
-nft add rule inet filter input ip protocol { tcp, udp } dport $K3 drop  # silent drop for wrong sequence
-
+nft add rule inet filter input ip protocol { tcp, udp } dport $K3 drop
 nft add rule inet filter knock add @xray_clients '{ ip saddr }'
 nft add rule inet filter knock add @xray_clients_v6 '{ ip6 saddr }'
 nft add rule inet filter knock drop
