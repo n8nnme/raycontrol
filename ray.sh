@@ -773,37 +773,32 @@ table inet filter {
         ip6 saddr @xray_clients_v6 icmpv6 type { echo-request, echo-reply } accept
 
 
-        tcp dport $K1 limit rate 3/minute burst 3 packets jump knock_stage1_handler
-        udp dport $K1 limit rate 3/minute burst 3 packets jump knock_stage1_handler
+        tcp dport $K1 limit rate 5/minute burst 3 packets jump knock_stage1_handler
+        udp dport $K1 limit rate 5/minute burst 3 packets jump knock_stage1_handler
         tcp dport $K1 add @knock_fail { ip saddr } log prefix "nft-knock-fail-v4: " drop
         udp dport $K1 add @knock_fail { ip saddr } log prefix "nft-knock-fail-v4: " drop
         tcp dport $K1 add @knock_fail_v6 { ip6 saddr } log prefix "nft-knock-fail-v6: " drop
         udp dport $K1 add @knock_fail_v6 { ip6 saddr } log prefix "nft-knock-fail-v6: " drop
 
 
-        tcp dport $K2 ip saddr @knock_stage1   limit rate 3/minute burst 3 packets jump knock_stage2_handler
-        udp dport $K2 ip saddr @knock_stage1   limit rate 3/minute burst 3 packets jump knock_stage2_handler
-        tcp dport $K2 ip6 saddr @knock_stage1_v6 limit rate 3/minute burst 3 packets jump knock_stage2_handler
-        udp dport $K2 ip6 saddr @knock_stage1_v6 limit rate 3/minute burst 3 packets jump knock_stage2_handler
+        tcp dport $K2 ip saddr @knock_stage1   limit rate 5/minute burst 3 packets jump knock_stage2_handler
+        udp dport $K2 ip saddr @knock_stage1   limit rate 5/minute burst 3 packets jump knock_stage2_handler
+        tcp dport $K2 ip6 saddr @knock_stage1_v6 limit rate 5/minute burst 3 packets jump knock_stage2_handler
+        udp dport $K2 ip6 saddr @knock_stage1_v6 limit rate 5/minute burst 3 packets jump knock_stage2_handler
         tcp dport $K2 add @knock_fail { ip saddr } log prefix "nft-knock-fail-v4: " drop
         udp dport $K2 add @knock_fail { ip saddr } log prefix "nft-knock-fail-v4: " drop
         tcp dport $K2 add @knock_fail_v6 { ip6 saddr } log prefix "nft-knock-fail-v6: " drop
         udp dport $K2 add @knock_fail_v6 { ip6 saddr } log prefix "nft-knock-fail-v6: " drop
-        tcp dport $K2 drop
-        udp dport $K2 drop
 
 
-        tcp dport $K3 ip saddr @knock_stage2   limit rate 3/minute burst 3 packets jump knock_final_handler
-        udp dport $K3 ip saddr @knock_stage2   limit rate 3/minute burst 3 packets jump knock_final_handler
-        tcp dport $K3 ip6 saddr @knock_stage2_v6 limit rate 3/minute burst 3 packets jump knock_final_handler
-        udp dport $K3 ip6 saddr @knock_stage2_v6 limit rate 3/minute burst 3 packets jump knock_final_handler
+        tcp dport $K3 ip saddr @knock_stage2   limit rate 5/minute burst 3 packets jump knock_final_handler
+        udp dport $K3 ip saddr @knock_stage2   limit rate 5/minute burst 3 packets jump knock_final_handler
+        tcp dport $K3 ip6 saddr @knock_stage2_v6 limit rate 5/minute burst 3 packets jump knock_final_handler
+        udp dport $K3 ip6 saddr @knock_stage2_v6 limit rate 5/minute burst 3 packets jump knock_final_handler
         tcp dport $K3 add @knock_fail { ip saddr } log prefix "nft-knock-fail-v4: " drop
         udp dport $K3 add @knock_fail { ip saddr } log prefix "nft-knock-fail-v4: " drop
         tcp dport $K3 add @knock_fail_v6 { ip6 saddr } log prefix "nft-knock-fail-v6: " drop
         udp dport $K3 add @knock_fail_v6 { ip6 saddr } log prefix "nft-knock-fail-v6: " drop
-        tcp dport $K3 drop
-        udp dport $K3 drop
-
 
         log prefix "input-drop: " drop
     }
