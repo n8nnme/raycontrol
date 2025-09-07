@@ -2,10 +2,10 @@ Just a simple xray (naive look like inbound + trojan) and hysteria2 solution wit
 
 # install:
 ```
-bash <(curl -Ls https://raw.githubusercontent.com/n8nnme/raycontrol/refs/heads/testing/ray.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/n8nnme/raycontrol/refs/heads/main/ray.sh)
 ```
 
 # uninstall:
 ```
-bash <(curl -Ls https://raw.githubusercontent.com/n8nnme/raycontrol/refs/heads/testing/uninstall.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/n8nnme/raycontrol/refs/heads/main/uninstall.sh)
 ```
