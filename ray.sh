@@ -789,8 +789,18 @@ table inet filter {
 
     chain output {
         type filter hook output priority 0; policy accept;
+        #DNS
         udp dport 53 accept
-        tcp dport {80,443} accept
+        tcp dport 53 accept
+        #HTTPS and DoH
+        tcp dport { 80, 443 } accept
+        udp dport { 80, 443 } accept
+        #DoT
+        tcp dport 853 accept
+        #DoHfallback
+        tcp dport 8443 accept
+        udp dport 8443 accept
+        #ICMP
         icmp type { echo-request, echo-reply } accept
         meta l4proto ipv6-icmp accept
     }
