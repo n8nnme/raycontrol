@@ -728,58 +728,76 @@ autodetect_inet_iface() {
     [[ -n $d ]] && { echo "$d"; return; }
     echo ""
 }
+
 IFACE=$(autodetect_inet_iface)
-[[ -z $IFACE ]] && echo "outgoing interface not detected; NAT disabled" || echo "outgoing interface: $IFACE"
+[[ -z $IFACE ]] && echo "⚠ outgoing interface not detected; NAT disabled" || echo "✓ outgoing interface: $IFACE"
 
+# Validate required variables
+if [[ -z "$K1" || -z "$K2" || -z "$K3" ]]; then
+    echo "ERROR: K1, K2, K3 not set in /etc/ray-aio/install.conf"
+    exit 1
+fi
+
+if [[ -z "$PORT_VLESS" || -z "$PORT_TROJAN" || -z "$PORT_HYSTERIA" || -z "$SSH_PORT" ]]; then
+    echo "ERROR: PORT_* variables not set in /etc/ray-aio/install.conf"
+    exit 1
+fi
+
+echo "✓ Configuration loaded:"
+echo "  K1 (knock stage 1): $K1"
+echo "  K2 (knock stage 2): $K2"
+echo "  K3 (knock stage 3): $K3"
+echo "  SSH_PORT: $SSH_PORT"
+echo "  PORT_VLESS: $PORT_VLESS"
+echo "  PORT_TROJAN: $PORT_TROJAN"
+echo "  PORT_HYSTERIA: $PORT_HYSTERIA"
+echo ""
+
+echo "Applying nftables ruleset..."
+
+# ============================================================================
+# NFTABLES CONFIGURATION
+# ============================================================================
+
+nft flush ruleset
 nft -f - <<EOF
-flush ruleset
-
 table inet filter {
-    set knock_stage1      { type ipv4_addr; flags dynamic; timeout 30s; size 200000; gc-interval 1m; }
-    set knock_stage2      { type ipv4_addr; flags dynamic; timeout 30s; size 200000; gc-interval 1m; }
-    set xray_clients      { type ipv4_addr; flags dynamic; timeout 10m; size 300000; gc-interval 5m; }
-    set knock_fail        { type ipv4_addr; flags dynamic; timeout 24h; size 500000; gc-interval 5m; }
-    set knock_stage1_v6   { type ipv6_addr; flags dynamic; timeout 30s; size 200000; gc-interval 1m; }
-    set knock_stage2_v6   { type ipv6_addr; flags dynamic; timeout 30s; size 200000; gc-interval 1m; }
-    set knock_fail_v6     { type ipv6_addr; flags dynamic; timeout 24h; size 500000; gc-interval 5m; }
+    set knock_stage1 { type ipv4_addr; flags timeout; timeout 30s; }
+    set knock_stage2 { type ipv4_addr; flags timeout; timeout 30s; }
+    set xray_clients { type ipv4_addr; flags timeout; timeout 10m; }
 
     chain input {
         type filter hook input priority 0; policy drop;
-
+        
         iif lo accept
         ct state { established, related } accept
         ct state invalid drop
 
-        ip saddr @knock_fail drop
-        ip6 saddr @knock_fail_v6 drop
-
-        ip saddr @xray_clients tcp dport { $PORT_VLESS, $PORT_TROJAN, $SSH_PORT } counter update @xray_clients { ip saddr } accept
-        ip saddr @xray_clients udp dport $PORT_HYSTERIA counter update @xray_clients { ip saddr } accept
+        # Allow already authenticated clients
+        ip saddr @xray_clients tcp dport { $SSH_PORT, $PORT_TROJAN, $PORT_VLESS } counter accept
+        ip saddr @xray_clients udp dport $PORT_HYSTERIA counter accept
         ip saddr @xray_clients icmp type { echo-request, echo-reply } accept
 
-        tcp dport $K1 limit rate 5/minute burst 3 packets jump knock_stage1_handler
-        udp dport $K1 limit rate 5/minute burst 3 packets jump knock_stage1_handler
-        tcp dport $K1 add @knock_fail { ip saddr } drop
-        udp dport $K1 add @knock_fail { ip saddr } drop
-        tcp dport $K1 add @knock_fail_v6 { ip6 saddr } drop
-        udp dport $K1 add @knock_fail_v6 { ip6 saddr } drop
+        # === PORT KNOCKING - STAGE 1 ===
+        tcp dport $K1 log prefix "KNOCK1_" drop
+        udp dport $K1 log prefix "KNOCK1_" drop
 
-        tcp dport $K2 ip saddr @knock_stage1 limit rate 5/minute burst 3 packets jump knock_stage2_handler
-        udp dport $K2 ip saddr @knock_stage1 limit rate 5/minute burst 3 packets jump knock_stage2_handler
-        tcp dport $K2 add @knock_fail { ip saddr } drop
-        udp dport $K2 add @knock_fail { ip saddr } drop
-        tcp dport $K2 add @knock_fail_v6 { ip6 saddr } drop
-        udp dport $K2 add @knock_fail_v6 { ip6 saddr } drop
+        # === PORT KNOCKING - STAGE 2 ===
+        tcp dport $K2 ip saddr @knock_stage1 log prefix "KNOCK2_" drop
+        udp dport $K2 ip saddr @knock_stage1 log prefix "KNOCK2_" drop
+        
+        tcp dport $K2 log prefix "KNOCK2_FAIL_" drop
+        udp dport $K2 log prefix "KNOCK2_FAIL_" drop
 
-        tcp dport $K3 ip saddr @knock_stage2 limit rate 5/minute burst 3 packets jump knock_final_handler
-        udp dport $K3 ip saddr @knock_stage2 limit rate 5/minute burst 3 packets jump knock_final_handler
-        tcp dport $K3 add @knock_fail { ip saddr } drop
-        udp dport $K3 add @knock_fail { ip saddr } drop
-        tcp dport $K3 add @knock_fail_v6 { ip6 saddr } drop
-        udp dport $K3 add @knock_fail_v6 { ip6 saddr } drop
+        # === PORT KNOCKING - STAGE 3 ===
+        tcp dport $K3 ip saddr @knock_stage2 log prefix "KNOCK3_" drop
+        udp dport $K3 ip saddr @knock_stage2 log prefix "KNOCK3_" drop
+        
+        tcp dport $K3 log prefix "KNOCK3_FAIL_" drop
+        udp dport $K3 log prefix "KNOCK3_FAIL_" drop
 
+        # ICMPv6
         icmpv6 type { nd-router-advert, nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
-        icmpv6 type { mld-listener-query, mld-listener-report, mld-listener-reduction } accept
         icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } accept
 
         drop
@@ -789,55 +807,152 @@ table inet filter {
 
     chain output {
         type filter hook output priority 0; policy accept;
-        #DNS
-        udp dport 53 accept
-        tcp dport 53 accept
-        #HTTPS and DoH
-        tcp dport { 80, 443 } accept
-        udp dport { 80, 443 } accept
-        #DoT
-        tcp dport 853 accept
-        #DoHfallback
-        tcp dport 8443 accept
-        udp dport 8443 accept
-        #ICMP
+        tcp dport { 53, 80, 443, 853, 8443 } accept
+        udp dport { 53, 80, 443 } accept
         icmp type { echo-request, echo-reply } accept
         meta l4proto ipv6-icmp accept
-    }
-
-    chain knock_stage1_handler {
-        add @knock_stage1 { ip saddr }
-        add @knock_stage1_v6 { ip6 saddr }
-        drop
-    }
-
-    chain knock_stage2_handler {
-        delete @knock_stage1 { ip saddr }
-        delete @knock_stage1_v6 { ip6 saddr }
-        add @knock_stage2 { ip saddr }
-        add @knock_stage2_v6 { ip6 saddr }
-        drop
-    }
-
-    chain knock_final_handler {
-        delete @knock_stage2 { ip saddr }
-        delete @knock_stage2_v6 { ip6 saddr }
-        add @xray_clients { ip saddr }
-        drop
     }
 }
 EOF
 
+echo "nftables ruleset applied"
+
+# ============================================================================
+# NAT CONFIGURATION
+# ============================================================================
+
 if [[ -n $IFACE ]]; then
+    echo "Applying NAT for interface: $IFACE"
     nft -f - <<NAT_EOF
-    table ip nat {
-        chain postrouting {
-            type nat hook postrouting priority 100; policy accept;
-            oifname "$IFACE" masquerade
-        }
+table ip nat {
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+        oifname "$IFACE" masquerade
     }
+}
 NAT_EOF
+    echo "NAT configured"
 fi
+
+# ============================================================================
+# KNOCK PROCESSOR SCRIPT
+# ============================================================================
+
+echo "Installing knock processor script..."
+
+cat > /usr/local/bin/nftables-knock-processor.sh <<'KNOCK_SCRIPT'
+#!/bin/bash
+# Port knock processor - reads dmesg logs and adds IPs to sets
+
+# === STAGE 1: Any knock on K1 -> add to knock_stage1 ===
+dmesg | tail -100 | grep "KNOCK1_" | grep -oP 'SRC=\K[0-9.]+' | sort -u | while read -r ip; do
+    if [[ -n "$ip" ]]; then
+        nft add element inet filter knock_stage1 { "$ip" } 2>/dev/null || true
+        logger -t nftables-knock "STAGE1: $ip added"
+    fi
+done
+
+# === STAGE 2: knock on K2 if IP in stage1 -> add to knock_stage2 ===
+dmesg | tail -100 | grep "KNOCK2_" | grep -v "FAIL" | grep -oP 'SRC=\K[0-9.]+' | sort -u | while read -r ip; do
+    if [[ -n "$ip" ]]; then
+        if nft list set inet filter knock_stage1 2>/dev/null | grep -q "$ip"; then
+            nft add element inet filter knock_stage2 { "$ip" } 2>/dev/null || true
+            logger -t nftables-knock "STAGE2: $ip promoted"
+        fi
+    fi
+done
+
+# === STAGE 3: knock on K3 if IP in stage2 -> GRANT ACCESS ===
+dmesg | tail -100 | grep "KNOCK3_" | grep -v "FAIL" | grep -oP 'SRC=\K[0-9.]+' | sort -u | while read -r ip; do
+    if [[ -n "$ip" ]]; then
+        if nft list set inet filter knock_stage2 2>/dev/null | grep -q "$ip"; then
+            nft add element inet filter xray_clients { "$ip" } 2>/dev/null || true
+            logger -t nftables-knock "STAGE3: $ip GRANTED ACCESS"
+        fi
+    fi
+done
+
+KNOCK_SCRIPT
+
+chmod +x /usr/local/bin/nftables-knock-processor.sh
+echo "✓ Knock processor installed"
+
+# ============================================================================
+# SYSTEMD TIMER
+# ============================================================================
+
+echo "Installing systemd service and timer..."
+
+cat > /etc/systemd/system/nftables-knock-processor.service <<'SERVICE'
+[Unit]
+Description=nftables Port Knock Processor
+After=nftables.service
+Wants=nftables.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/nftables-knock-processor.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nftables-knock
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+cat > /etc/systemd/system/nftables-knock-processor.timer <<'TIMER'
+[Unit]
+Description=nftables Port Knock Processor Timer
+Requires=nftables-knock-processor.service
+
+[Timer]
+OnBootSec=2s
+OnUnitActiveSec=2s
+AccuracySec=100ms
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+systemctl daemon-reload
+systemctl enable nftables-knock-processor.timer
+systemctl start nftables-knock-processor.timer
+
+echo "Systemd timer enabled and started"
+
+# ============================================================================
+# STATUS
+# ============================================================================
+
+echo ""
+echo "=========================================="
+echo "  PORT KNOCKING FIREWALL DEPLOYED"
+echo "=========================================="
+echo ""
+echo "Knock Sequence:"
+echo "  1. nc -zv server $K1   (stage 1 - 30s window)"
+echo "  2. nc -zv server $K2   (stage 2 - 30s window)"
+echo "  3. nc -zv server $K3   (stage 3 - 10m access)"
+echo ""
+echo "Accessible ports after knock:"
+echo "  TCP: $SSH_PORT (SSH), $PORT_TROJAN (Trojan), $PORT_VLESS (VLESS)"
+echo "  UDP: $PORT_HYSTERIA (Hysteria)"
+echo ""
+echo "Then connect:"
+echo "  ssh user@server -p $SSH_PORT"
+echo ""
+echo "Monitoring:"
+echo "  # Watch knock logs in real-time:"
+echo "  journalctl -t nftables-knock -f"
+echo ""
+echo "  # See dmesg logs:"
+echo "  dmesg | tail -20 | grep KNOCK"
+echo ""
+echo "  # Check current knock stages:"
+echo "  echo '=== STAGE 1 ==='; nft list set inet filter knock_stage1"
+echo "  echo '=== STAGE 2 ==='; nft list set inet filter knock_stage2"
+echo "  echo '=== ACTIVE CLIENTS ==='; nft list set inet filter xray_clients"
+echo ""
 SCRIPT_EOF
 chmod +x "$APPLY_NFTABLES_SCRIPT"
 
