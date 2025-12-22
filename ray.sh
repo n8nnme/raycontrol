@@ -310,7 +310,7 @@ log_info "--- Validating DNS Records ---"
 SERVER_IP=$(curl -s https://4.ipwho.de/ip); if [[ -z "$SERVER_IP" ]]; then log_error "Could not determine server's public IP address."; exit 1; fi
 log_info "This server's public IP is: $SERVER_IP"; log_warn "Please ensure you have an A record for $DOMAIN pointing to this IP in your Cloudflare DNS."
 log_warn "Waiting 30 seconds for DNS to propagate..."; for i in {30..1}; do printf "\rWaiting... %2d" "$i"; sleep 1; done; echo -e "\rDone waiting. Now checking DNS resolution."
-RESOLVED_IP=$(dig +short "$DOMAIN" @1.1.1.1 || echo ""); log_info "Resolved IP for $DOMAIN is: ${RESOLVED_IP:-Not found}"
+RESOLVED_IP=$(dig +short "$DOMAIN" || echo ""); log_info "Resolved IP for $DOMAIN is: ${RESOLVED_IP:-Not found}"
 if [[ "$RESOLVED_IP" != "$SERVER_IP" ]]; then log_error "DNS validation failed! The domain $DOMAIN does not resolve to this server's IP ($SERVER_IP)."; exit 1; fi
 log_info "DNS validation successful!"
 
