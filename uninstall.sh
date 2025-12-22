@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 set -uo pipefail
 
 GREEN='\033[0;32m'
@@ -6,11 +7,11 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-function step() {
+step() {
     echo -e "\n${YELLOW}--- $1 ---${NC}"
 }
 
-function remove_file_if_exists() {
+remove_file_if_exists() {
     local file_path=$1
     if [[ -e "$file_path" ]]; then
         rm -rf "$file_path"
@@ -19,6 +20,7 @@ function remove_file_if_exists() {
         echo "Not found (OK): $file_path"
     fi
 }
+
 remove_dir_if_exists() { remove_file_if_exists "$1"; }
 
 if [[ $EUID -ne 0 ]]; then
@@ -26,14 +28,15 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-step "Ray.sh Smart Uninstaller"
+step "Ray-AIO Smart Uninstaller"
+
 cat <<-EOF
 This script will:
-  1) Disable & stop ray.sh services and PostgreSQL
-  2) Flush firewall rules
-  3) Drop the PostgreSQL database and user
-  4) Remove certificates & configuration files
-  5) (Optionally) Remove dependencies and the XanMod kernel
+1) Disable & stop Ray-AIO services and PostgreSQL
+2) Flush firewall rules
+3) Drop the PostgreSQL database and user
+4) Remove certificates & configuration files
+5) (Optionally) Remove dependencies and the XanMod kernel
 EOF
 
 read -rp "Proceed with uninstallation? [y/N]: " CONFIRM
@@ -64,7 +67,7 @@ for svc in xray hysteria-server postgresql; do
 done
 
 step "Flushing Firewall Rules"
-if command -v nft &>/dev/null; then
+if command -v nft >/dev/null; then
     nft flush ruleset || true
     nft -s list ruleset > /etc/nftables.conf || true
     echo "Cleared NFTables rules; saved empty config."
@@ -73,20 +76,53 @@ else
 fi
 
 step "Dropping PostgreSQL Database and User"
-DB_CONF="/root/.secrets/db.conf"
+SECRETS_DIR="/root/.secrets"
+DB_CONF="${SECRETS_DIR}/db.conf"
 if [[ -f "$DB_CONF" ]]; then
     # shellcheck source=/dev/null
     source "$DB_CONF" || true
-    if [[ -n "${PG_DB_NAME:-}" && -n "${PG_USER:-}" ]]; then
-       echo "Dropping database '$PG_DB_NAME' and user '$PG_USER'..."
-       sudo -u postgres psql -c "DROP DATABASE IF EXISTS \"$PG_DB_NAME\";" || true
-       sudo -u postgres psql -c "DROP USER IF EXISTS \"$PG_USER\";" || true
-       echo "PostgreSQL cleanup complete."
-    else
-        echo "PostgreSQL config found, but DB name/user variables not set."
+elif [[ -f "/etc/ray-aio/install.conf" ]]; then
+    # shellcheck source=/dev/null
+    source "/etc/ray-aio/install.conf" || true
+fi
+
+if [[ -n "${PG_DB_NAME:-}" && -n "${PG_USER:-}" ]]; then
+    echo "Dropping database '$PG_DB_NAME' and user '$PG_USER'..."
+    # Ensure PostgreSQL service is running to accept connections at drop time
+    systemctl is-active --quiet postgresql || {
+        echo "PostgreSQL not running, starting service temporarily..."
+        systemctl start postgresql || { echo "Failed to start PostgreSQL service."; exit 1; }
+        STOP_PG=true
+    }
+
+    # Retry dropping DB and user with timeout
+    for i in {1..5}; do
+        if sudo -u postgres psql -c "DROP DATABASE IF EXISTS \"$PG_DB_NAME\";"; then
+            break
+        else
+            echo "Failed to drop database, retrying in 2 seconds..."
+            sleep 2
+        fi
+    done
+
+    for i in {1..5}; do
+        if sudo -u postgres psql -c "DROP USER IF EXISTS \"$PG_USER\";"; then
+            break
+        else
+            echo "Failed to drop user, retrying in 2 seconds..."
+            sleep 2
+        fi
+    done
+
+    # If started PostgreSQL above, stop it now
+    if [[ $STOP_PG == true ]]; then
+        echo "Stopping PostgreSQL service started temporarily..."
+        systemctl stop postgresql || true
     fi
+
+    echo "PostgreSQL cleanup complete."
 else
-    echo "PostgreSQL config not found; skipping database drop."
+    echo "PostgreSQL config not found or DB name/user variables not set; skipping database drop."
 fi
 
 step "Phase 2: Removing Files and Configurations"
@@ -97,8 +133,8 @@ remove_file_if_exists "/etc/systemd/system/hysteria-server.service"
 systemctl daemon-reload || true
 
 step "Removing Let's Encrypt Certificate"
-if [[ -n "${DOMAIN}" ]] && command -v certbot &>/dev/null; then
-    if certbot certificates --cert-name "$DOMAIN" &>/dev/null; then
+if [[ -n "${DOMAIN}" ]] && command -v certbot >/dev/null; then
+    if certbot certificates --cert-name "$DOMAIN" >/dev/null; then
         certbot delete --non-interactive --cert-name "$DOMAIN" || true
         echo "Deleted certificate for $DOMAIN."
     else
@@ -123,18 +159,21 @@ remove_dir_if_exists "/root/.secrets"
 remove_file_if_exists "/var/log/raycontrol.log"
 
 step "Phase 3: Removing Packages"
+
 CORE_DEPS=(
-  curl wget unzip jq nftables certbot qrencode
-  python3-certbot-dns-cloudflare uuid-runtime openssl
-  socat gawk dnsutils ssl-cert conntrack bc watch
-  postgresql postgresql-client postgresql-contrib
+    curl wget unzip jq nftables certbot qrencode
+    python3-certbot-dns-cloudflare uuid-runtime
+    socat gawk dnsutils bc bsdmainutils
+    postgresql postgresql-client postgresql-contrib
 )
+
 echo "The following packages were installed as dependencies:"
 echo -e "${YELLOW}${CORE_DEPS[*]}${NC}"
 echo "Removing these may affect other applications on the system."
 read -rp "Do you want to remove these packages? [y/N]: " RM_DEPS
 if [[ "${RM_DEPS,,}" == "y" ]]; then
-    apt-get remove --purge -y "${CORE_DEPS[@]}" || true
+    DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y "${CORE_DEPS[@]}" || true
+    DEBIAN_FRONTEND=noninteractive apt-get autoremove -y || true
     echo -e "${GREEN}Dependencies removed.${NC}"
 else
     echo "Skipped dependency removal."
@@ -144,7 +183,7 @@ step "Optional: XanMod Kernel"
 if [[ -f "/etc/apt/sources.list.d/xanmod-kernel.list" ]]; then
     read -rp "Do you want to remove the XanMod repository and any installed XanMod kernels? [y/N]: " RX
     if [[ "${RX,,}" == "y" ]]; then
-        apt-get remove --purge -y "linux-xanmod-*" || true
+        DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y "linux-xanmod-*" || true
         remove_file_if_exists "/etc/apt/sources.list.d/xanmod-kernel.list"
         remove_file_if_exists "/etc/apt/trusted.gpg.d/xanmod-kernel.gpg"
         apt-get update || true
@@ -157,5 +196,5 @@ else
 fi
 
 step "Uninstallation Complete"
-echo -e "${GREEN}All known ray.sh script artifacts have been removed.${NC}"
+echo -e "${GREEN}All known Ray-AIO script artifacts have been removed.${NC}"
 echo "Please reboot the system if you removed a kernel."

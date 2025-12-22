@@ -35,8 +35,24 @@ CLOUDFLARE_INI="$SECRETS_DIR/cloudflare.ini"
 DB_CONF="$SECRETS_DIR/db.conf"
 LE_POST_HOOK_DIR="/etc/letsencrypt/renewal-hooks/post"
 LE_POST_HOOK_SCRIPT="$LE_POST_HOOK_DIR/reload_services.sh"
-TEMP_ZIP="/tmp/Xray-linux-64.zip"
-TEMP_AWK="/tmp/check_x86_v_level.awk"
+TMP_DIR="$(mktemp -d)"
+TEMP_AWK="${TMP_DIR}/check_x86_v_level.awk"
+ORIG_DIR="$PWD"
+
+# --- Configuration: urls ---
+
+# hysteria2
+RAW_TAG=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r .tag_name)
+ENC_TAG=${RAW_TAG//\//%2F}
+HYSTERIA_URL_BIN="https://github.com/apernet/hysteria/releases/download/${ENC_TAG}/hysteria-linux-amd64"
+HYSTERIA_URL_HASHES="https://github.com/apernet/hysteria/releases/download/${ENC_TAG}/hashes.txt"
+
+# xray
+XRAY_VER=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+TEMP_ZIP="${TMP_DIR}/Xray-linux-64.zip"
+TEMP_DGST="${TMP_DIR}/Xray-linux-64.zip.dgst"
+
+
 
 # --- Configuration: Colors ---
 GREEN='\033[0;32m'
@@ -88,7 +104,7 @@ cleanup() {
            sudo -u postgres psql -c "DROP USER IF EXISTS \"$PG_USER\";" &>/dev/null
         fi
         log_warn "Purging PostgreSQL packages..."
-        apt-get purge -y --auto-remove postgresql* &>/dev/null
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y --auto-remove postgresql* &>/dev/null
     fi
 
     systemctl daemon-reload
@@ -98,12 +114,14 @@ cleanup() {
 
     if [[ -n "${XANMOD_PKG_NAME_INSTALLED:-}" ]]; then
         log_warn "Uninstalling XanMod Kernel package: ${XANMOD_PKG_NAME_INSTALLED}"
-        apt-get remove -y "$XANMOD_PKG_NAME_INSTALLED"
+        DEBIAN_FRONTEND=noninteractive apt-get remove -y "$XANMOD_PKG_NAME_INSTALLED"
     fi
 
     log_warn "Removing temporary files..."
     rm -f "$TEMP_AWK" "$TEMP_ZIP" "$RAYCONTROL_PATH"
 
+    cd "$ORIG_DIR"
+    rm -rf "${TMP_DIR}"
     log_warn "Rollback complete. The system may require manual cleanup."
     exit 1
 }
@@ -119,9 +137,11 @@ if [[ $EUID -ne 0 ]]; then
   log_error "This script must be run as root."; exit 1
 fi
 
+cd "${TMP_DIR}"
+
 log_info "--- Installing Core Dependencies ---"
 apt-get update
-apt-get install -y curl wget unzip jq nftables certbot qrencode python3-certbot-dns-cloudflare uuid-runtime openssl socat gawk dnsutils bc coreutils watch postgresql postgresql-client bsdmainutils
+DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget unzip jq nftables certbot qrencode python3-certbot-dns-cloudflare uuid-runtime openssl socat gawk dnsutils bc coreutils watch postgresql postgresql-client bsdmainutils
 
 read -rp "Domain (e.g. your.domain.com): " DOMAIN
 read -rp "Cloudflare API Token: " CF_API_TOKEN
@@ -219,14 +239,20 @@ chmod 600 "$HYSTERIA_DB_CONF"
 
 systemctl enable --now postgresql
 
-ORIG_DIR="$PWD"
-cd /tmp
+if sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "$PG_DB_NAME"; then
+    log_warn "Database '$PG_DB_NAME' already exists. Dropping it..."
+    sudo -u postgres psql -c "DROP DATABASE \"$PG_DB_NAME\";"
+fi
+if sudo -u postgres psql -tqc "SELECT 1 FROM pg_roles WHERE rolname = '$PG_USER';" | grep -q 1; then
+    log_warn "Role '$PG_USER' already exists. Dropping it..."
+    sudo -u postgres psql -c "DROP ROLE IF EXISTS \"$PG_USER\";"
+fi
+
 sudo -u postgres psql -c "CREATE DATABASE \"$PG_DB_NAME\";"
 sudo -u postgres psql -c "CREATE USER \"$PG_USER\" WITH PASSWORD '$PG_PASSWORD';"
 sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"$PG_DB_NAME\" TO \"$PG_USER\";"
 sudo -u postgres psql -d "$PG_DB_NAME" -c \
   "GRANT USAGE, CREATE ON SCHEMA public TO \"$PG_USER\";"
-cd "$ORIG_DIR"
 export PGPASSWORD=$PG_PASSWORD
 psql -h localhost -U "$PG_USER" -d "$PG_DB_NAME" -c "
   CREATE TABLE xray_users (
@@ -247,7 +273,7 @@ log_info "PostgreSQL is configured for local network connections only by default
 
 if [[ "${INSTALL_XANMOD,,}" == "y" ]]; then
     log_info "--- Setting up XanMod Repository ---"
-    apt-get install -y gpg
+    DEBIAN_FRONTEND=noninteractive apt-get install -y gpg
     echo 'deb http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-kernel.list
     wget -qO - https://dl.xanmod.org/gpg.key | gpg --dearmor -o /etc/apt/trusted.gpg.d/xanmod-kernel.gpg
     log_info "--- Updating sources for XanMod ---"; apt-get update
@@ -273,7 +299,7 @@ AWK
         *) XANMOD_PKG_NAME="linux-xanmod-lts-x64v1" ;;
     esac
     log_info "--- Installing XanMod Kernel ($XANMOD_PKG_NAME) ---"
-    apt-get install -y "$XANMOD_PKG_NAME"; XANMOD_PKG_NAME_INSTALLED=$XANMOD_PKG_NAME
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$XANMOD_PKG_NAME"; XANMOD_PKG_NAME_INSTALLED=$XANMOD_PKG_NAME
 fi
 
 UUID_VLESS=$(uuidgen); PASSWORD_TROJAN=$(head -c16 /dev/urandom | base64 | tr '+/' '_-' | cut -c1-16)
@@ -284,7 +310,7 @@ log_info "--- Validating DNS Records ---"
 SERVER_IP=$(curl -s https://4.ipwho.de/ip); if [[ -z "$SERVER_IP" ]]; then log_error "Could not determine server's public IP address."; exit 1; fi
 log_info "This server's public IP is: $SERVER_IP"; log_warn "Please ensure you have an A record for $DOMAIN pointing to this IP in your Cloudflare DNS."
 log_warn "Waiting 30 seconds for DNS to propagate..."; for i in {30..1}; do printf "\rWaiting... %2d" "$i"; sleep 1; done; echo -e "\rDone waiting. Now checking DNS resolution."
-RESOLVED_IP=$(dig +short "$DOMAIN" @1.1.1.1 || echo ""); log_info "Resolved IP for $DOMAIN is: ${RESOLVED_IP:-Not found}"
+RESOLVED_IP=$(dig +short "$DOMAIN" || echo ""); log_info "Resolved IP for $DOMAIN is: ${RESOLVED_IP:-Not found}"
 if [[ "$RESOLVED_IP" != "$SERVER_IP" ]]; then log_error "DNS validation failed! The domain $DOMAIN does not resolve to this server's IP ($SERVER_IP)."; exit 1; fi
 log_info "DNS validation successful!"
 
@@ -685,35 +711,137 @@ esac
 EOF
 chmod +x "$RAYCONTROL_PATH"
 
-cat > "$APPLY_NFTABLES_SCRIPT" <<EOF
+cat > "$APPLY_NFTABLES_SCRIPT" <<'SCRIPT_EOF'
 #!/usr/bin/env bash
 set -e
 # shellcheck source=/dev/null
 source /etc/ray-aio/install.conf
-nft flush ruleset
-nft add table inet filter
-nft add chain inet filter input '{ type filter hook input priority 0; policy drop; }'
-nft add chain inet filter forward '{ type filter hook forward priority 0; policy drop; }'
-nft add chain inet filter output '{ type filter hook output priority 0; policy accept; }'
-nft add set inet filter knock_stage1 '{ type ipv4_addr; flags dynamic; timeout 10s; }'
-nft add set inet filter knock_stage2 '{ type ipv4_addr; flags dynamic; timeout 10s; }'
-nft add set inet filter xray_clients '{ type ipv4_addr; flags dynamic; timeout 10m; }'
-nft add chain inet filter knock
-nft add rule inet filter input iif lo accept
-nft add rule inet filter input ip saddr @xray_clients tcp dport \$PORT_VLESS counter update @xray_clients '{ ip saddr }' accept
-nft add rule inet filter input ip saddr @xray_clients tcp dport \$PORT_TROJAN counter update @xray_clients '{ ip saddr }' accept
-nft add rule inet filter input ip saddr @xray_clients udp dport \$PORT_HYSTERIA counter update @xray_clients '{ ip saddr }' accept
-nft add rule inet filter input ip saddr @xray_clients tcp dport \$SSH_PORT counter update @xray_clients '{ ip saddr }' accept
-nft add rule inet filter input ct state established,related accept
-nft add rule inet filter input ip protocol icmp accept
-nft add rule inet filter input ip6 nexthdr ipv6-icmp accept
-nft add rule inet filter input tcp dport \$K1 add @knock_stage1 '{ ip saddr }' drop
-nft add rule inet filter input tcp dport \$K2 ip saddr @knock_stage1 add @knock_stage2 '{ ip saddr }' drop
-nft add rule inet filter input tcp dport \$K3 ip saddr @knock_stage2 jump knock
-nft add rule inet filter knock add @xray_clients '{ ip saddr }'
-nft add rule inet filter knock drop
+
+autodetect_inet_iface() {
+    [[ -n ${INTERNET_IFACE:-} ]] && { echo "$INTERNET_IFACE"; return; }
+    local d
+    d=$(ip -4 route list 0/0 2>/dev/null | grep -oP 'dev \\K\\S+' | head -1)
+    [[ -n $d ]] && { echo "$d"; return; }
+    d=$(ip -6 route list default 2>/dev/null | grep -oP 'dev \\K\\S+' | head -1)
+    [[ -n $d ]] && { echo "$d"; return; }
+    d=$(ip -o -4 addr show scope global | awk '{print $2}' | head -1)
+    [[ -n $d ]] && { echo "$d"; return; }
+    echo ""
+}
+IFACE=$(autodetect_inet_iface)
+[[ -z $IFACE ]] && echo "outgoing interface not detected; NAT disabled" || echo "outgoing interface: $IFACE"
+
+nft -f - <<EOF
+flush ruleset
+
+table inet filter {
+    set knock_stage1      { type ipv4_addr; flags dynamic; timeout 30s; size 200000; gc-interval 1m; }
+    set knock_stage2      { type ipv4_addr; flags dynamic; timeout 30s; size 200000; gc-interval 1m; }
+    set xray_clients      { type ipv4_addr; flags dynamic; timeout 10m; size 300000; gc-interval 5m; }
+    set knock_fail        { type ipv4_addr; flags dynamic; timeout 24h; size 500000; gc-interval 5m; }
+    set knock_stage1_v6   { type ipv6_addr; flags dynamic; timeout 30s; size 200000; gc-interval 1m; }
+    set knock_stage2_v6   { type ipv6_addr; flags dynamic; timeout 30s; size 200000; gc-interval 1m; }
+    set knock_fail_v6     { type ipv6_addr; flags dynamic; timeout 24h; size 500000; gc-interval 5m; }
+
+    chain input {
+        type filter hook input priority 0; policy drop;
+
+        iif lo accept
+        ct state { established, related } accept
+        ct state invalid drop
+
+        ip saddr @knock_fail drop
+        ip6 saddr @knock_fail_v6 drop
+
+        ip saddr @xray_clients tcp dport { $PORT_VLESS, $PORT_TROJAN, $SSH_PORT } counter update @xray_clients { ip saddr } accept
+        ip saddr @xray_clients udp dport $PORT_HYSTERIA counter update @xray_clients { ip saddr } accept
+        ip saddr @xray_clients icmp type { echo-request, echo-reply } accept
+
+        tcp dport $K1 limit rate 5/minute burst 3 packets jump knock_stage1_handler
+        udp dport $K1 limit rate 5/minute burst 3 packets jump knock_stage1_handler
+        tcp dport $K1 add @knock_fail { ip saddr } drop
+        udp dport $K1 add @knock_fail { ip saddr } drop
+        tcp dport $K1 add @knock_fail_v6 { ip6 saddr } drop
+        udp dport $K1 add @knock_fail_v6 { ip6 saddr } drop
+
+        tcp dport $K2 ip saddr @knock_stage1 limit rate 5/minute burst 3 packets jump knock_stage2_handler
+        udp dport $K2 ip saddr @knock_stage1 limit rate 5/minute burst 3 packets jump knock_stage2_handler
+        tcp dport $K2 add @knock_fail { ip saddr } drop
+        udp dport $K2 add @knock_fail { ip saddr } drop
+        tcp dport $K2 add @knock_fail_v6 { ip6 saddr } drop
+        udp dport $K2 add @knock_fail_v6 { ip6 saddr } drop
+
+        tcp dport $K3 ip saddr @knock_stage2 limit rate 5/minute burst 3 packets jump knock_final_handler
+        udp dport $K3 ip saddr @knock_stage2 limit rate 5/minute burst 3 packets jump knock_final_handler
+        tcp dport $K3 add @knock_fail { ip saddr } drop
+        udp dport $K3 add @knock_fail { ip saddr } drop
+        tcp dport $K3 add @knock_fail_v6 { ip6 saddr } drop
+        udp dport $K3 add @knock_fail_v6 { ip6 saddr } drop
+
+        icmpv6 type { nd-router-advert, nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
+        icmpv6 type { mld-listener-query, mld-listener-report, mld-listener-reduction } accept
+        icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } accept
+
+        drop
+    }
+
+    chain forward { type filter hook forward priority 0; policy drop; }
+
+    chain output {
+        type filter hook output priority 0; policy accept;
+        #DNS
+        udp dport 53 accept
+        tcp dport 53 accept
+        #HTTPS and DoH
+        tcp dport { 80, 443 } accept
+        udp dport { 80, 443 } accept
+        #DoT
+        tcp dport 853 accept
+        #DoHfallback
+        tcp dport 8443 accept
+        udp dport 8443 accept
+        #ICMP
+        icmp type { echo-request, echo-reply } accept
+        meta l4proto ipv6-icmp accept
+    }
+
+    chain knock_stage1_handler {
+        add @knock_stage1 { ip saddr }
+        add @knock_stage1_v6 { ip6 saddr }
+        drop
+    }
+
+    chain knock_stage2_handler {
+        delete @knock_stage1 { ip saddr }
+        delete @knock_stage1_v6 { ip6 saddr }
+        add @knock_stage2 { ip saddr }
+        add @knock_stage2_v6 { ip6 saddr }
+        drop
+    }
+
+    chain knock_final_handler {
+        delete @knock_stage2 { ip saddr }
+        delete @knock_stage2_v6 { ip6 saddr }
+        add @xray_clients { ip saddr }
+        drop
+    }
+}
 EOF
+
+if [[ -n $IFACE ]]; then
+    nft -f - <<NAT_EOF
+    table ip nat {
+        chain postrouting {
+            type nat hook postrouting priority 100; policy accept;
+            oifname "$IFACE" masquerade
+        }
+    }
+NAT_EOF
+fi
+SCRIPT_EOF
 chmod +x "$APPLY_NFTABLES_SCRIPT"
+
+
 
 log_info "--- Issuing Certificate with Certbot ---"
 mkdir -p "$SECRETS_DIR"; cat > "$CLOUDFLARE_INI" <<< "dns_cloudflare_api_token = $CF_API_TOKEN"; chmod 600 "$CLOUDFLARE_INI"
@@ -731,9 +859,20 @@ chmod +x "$LE_POST_HOOK_SCRIPT"
 
 log_info "--- Installing Xray-core ---"
 mkdir -p "$XRAY_DIR" "$XRAY_LOG_DIR"; chown -R nobody:nogroup "$XRAY_DIR" "$XRAY_LOG_DIR"
-XRAY_VER=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
-wget -qO "$TEMP_ZIP" "https://github.com/XTLS/Xray-core/releases/download/$XRAY_VER/Xray-linux-64.zip"
-unzip -qo "$TEMP_ZIP" -d /usr/local/bin; rm "$TEMP_ZIP"; chmod +x "$XRAY_BIN"
+wget -qO "${TEMP_ZIP}" "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VER}/Xray-linux-64.zip"
+wget -qO "${TEMP_DGST}" "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VER}/Xray-linux-64.zip.dgst"
+XRAY_HASH=$(grep '^SHA2-256=' "${TEMP_DGST}" | cut -d'=' -f2 | tr -d '[:space:]')
+CALC_HASH=$(sha256sum "${TEMP_ZIP}" | awk '{print $1}' | tr -d '[:space:]')
+if [[ "$CALC_HASH" == "$XRAY_HASH" ]]; then
+    log_info "Checksum OK: xray"
+else
+    log_error "ERROR: checksum mismatch - xray"
+    echo "Expected: $XRAY_HASH"
+    echo "Actual:   $CALC_HASH"
+    exit 1
+fi
+unzip -qo "${TEMP_ZIP}" -d "$(dirname "$XRAY_BIN")"
+chmod +x "$XRAY_BIN"
 
 cat > "$XRAY_CONFIG_TPL" <<EOF
 {
@@ -778,10 +917,26 @@ WantedBy=multi-user.target
 EOF
 
 log_info "--- Installing Hysteria2 ---"
-RAW_TAG=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r .tag_name)
-ENC_TAG=${RAW_TAG//\//%2F}
-wget -nv -O "$HYSTERIA_BIN" "https://github.com/apernet/hysteria/releases/download/${ENC_TAG}/hysteria-linux-amd64"
-chmod +x "$HYSTERIA_BIN"; log_info "Hysteria2 installed successfully!"
+
+wget -q -O hysteria-linux-amd64 "${HYSTERIA_URL_BIN}" || { log_error "Failed to download binary"; exit 1; }
+wget -q -O hashes.txt           "${HYSTERIA_URL_HASHES}" || { log_error "Failed to download hashes.txt"; exit 1; }
+
+for f in hysteria-linux-amd64 hashes.txt; do
+  [[ -s "$f" ]] || { log_error "$f is empty or missing"; exit 1; }
+done
+
+grep -E 'hysteria-linux-amd64$' hashes.txt | sed 's|build/||' > chk.txt
+
+if sha256sum -c chk.txt --status; then
+    log_info "Checksum OK: hysteria2"
+else
+    log_error "ERROR: Checksum mismatch - hysteria2"
+    sha256sum -c chk.txt
+    exit 1
+fi
+
+install -m 0755 hysteria-linux-amd64 "${HYSTERIA_BIN}"
+log_info "Hysteria2 installed successfully!"
 
 cat > "$HYSTERIA_CONFIG" <<EOF
 listen: :$PORT_HYSTERIA
@@ -887,3 +1042,7 @@ else
 fi
 echo -e "\nUse ${GREEN}'$RAYCONTROL_PATH help'${NC} for a full list of commands."
 echo -e "\n${GREEN}=========================================================================================${NC}\n"
+
+
+cd "$ORIG_DIR"
+rm -rf "${TMP_DIR}"
